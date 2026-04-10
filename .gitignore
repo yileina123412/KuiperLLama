@@ -1,0 +1,25 @@
+# 编译产物
+build/
+cmake-build-debug/
+cmake-build-release/
+*.o
+*.out
+*.so
+
+# 模型权重
+*.bin
+*.pth
+*.pt
+*.safetensors
+*.model
+models/
+
+# 日志/缓存
+*.log
+*.tmp
+temp/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
