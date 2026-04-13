@@ -2,7 +2,7 @@
 #define KUIPER_INCLUDE_OP_ENCODE_H_
 #include <sentencepiece_processor.h>
 #include "layer.h"
-#if defined (LLAMA3_SUPPORT) || defined (QWEN2_SUPPORT) || defined (QWEN3_SUPPORT)
+#if defined(LLAMA3_SUPPORT) || defined(QWEN2_SUPPORT) || defined(QWEN3_SUPPORT)
 #include <absl/strings/str_join.h>
 #include <absl/strings/str_replace.h>
 #include <absl/strings/str_split.h>
@@ -31,8 +31,8 @@ class EncodeLayerBase : public Layer {
   virtual int32_t vocab_size() const = 0;
 
  protected:
-  bool has_bos_ = true;
-  bool has_eos_ = false;
+  bool has_bos_ = true;   // 是否在文本开头添加 <BOS> 开始符
+  bool has_eos_ = false;  // 是否在文本结尾添加 <EOS> 结束符
   std::string token_model_path_;
 };
 
@@ -54,9 +54,9 @@ class SpeEncodeLayer : public EncodeLayerBase {
   std::unique_ptr<sentencepiece::SentencePieceProcessor> spe;
 };
 
-#if defined (LLAMA3_SUPPORT) || defined (QWEN2_SUPPORT) || defined (QWEN3_SUPPORT)
+#if defined(LLAMA3_SUPPORT) || defined(QWEN2_SUPPORT) || defined(QWEN3_SUPPORT)
 class BpeEncodeLayer : public EncodeLayerBase {
-public:
+ public:
   explicit BpeEncodeLayer(std::string token_model_path, bool has_bos, bool has_eos);
 
   std::vector<int32_t> encode(const std::string& sentence) const override;
@@ -79,7 +79,7 @@ public:
 };
 
 class QwenEncodeLayer : public BpeEncodeLayer {
-public:
+ public:
   explicit QwenEncodeLayer(std::string token_model_path, bool has_bos, bool has_eos);
 };
 #endif

@@ -4,6 +4,7 @@
 #include "kernels/kernels_interface.h"
 // 应用旋转位置编码
 namespace op {
+// 五个输入分别是：input_q,input_k,input_pos,sin_cache,cos_cache
 RoPELayer::RoPELayer(base::DeviceType device_type, int32_t dim, int32_t kv_dim, int32_t head_size)
     : Layer(device_type, LayerType::kLayerRoPe, "RoPe"),
       dim_(dim),
@@ -35,28 +36,6 @@ base::Status RoPELayer::forward() {
   return base::error::Success();
 }
 
-// base::Status RoPELayer::check() const {
-//   // pos tensor
-//   auto status = check_tensor_with_dim(get_input(2), base::DeviceType::kDeviceCPU,
-//                                       base::DataType::kDataTypeInt32, 1);
-//   if (!status) {
-//     LOG(ERROR) << "The input tensor 2 error in the add layer.";
-//     return status;
-//   }
-
-//   status = check_tensor_with_dim(get_input(1), device_type_, data_type_, kv_dim_);
-//   if (!status) {
-//     LOG(ERROR) << "The input tensor 1 error in the add layer.";
-//     return status;
-//   }
-
-//   status = check_tensor_with_dim(get_input(0), device_type_, data_type_, dim_);
-//   if (!status) {
-//     LOG(ERROR) << "The input tensor 0 error in the add layer.";
-//     return status;
-//   }
-//   return base::error::Success();
-// }
 //  输入校验，确保张量维度、类型、设备类型合法
 base::Status RoPELayer::check() const {
   // pos tensor: CPU int32[1]，2D 时它表示 start_pos

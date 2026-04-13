@@ -1,6 +1,8 @@
 #ifndef KUIPER_INCLUDE_MODEL_MODEL_H_
 #define KUIPER_INCLUDE_MODEL_MODEL_H_
 #include <op/embedding.h>
+#include <cstdint>
+#include <cstring>
 #include <map>
 #include <string>
 #include "config.h"
@@ -105,6 +107,15 @@ class Model {
   int32_t group_size_ = 1;
   // 是否为量化模型
   bool is_quant_model_ = false;
+
+  enum class QuantFormat : uint8_t {
+    kNone = 0,
+    kInt8Q8 = 1,
+    kAwq4 = 2,
+  };
+
+  QuantFormat quant_format_ = QuantFormat::kNone;
+
   // 模型的配置信息  维度，层数，头数
   std::unique_ptr<TransformerConfig> config_;
 

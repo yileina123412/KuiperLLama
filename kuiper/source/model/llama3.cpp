@@ -10,7 +10,7 @@
 #include "../op/kernels/cuda/rope_kernel.cuh"
 #include "base/tick.h"
 namespace model {
-
+// 从 2D 张量中提取第 row 行，创建一个 1D 视图（View），避免数据复制。
 static tensor::Tensor row_view_fp32(const tensor::Tensor& mat2d, int32_t row, int32_t dim,
                                     base::DeviceType device_type) {
   float* base_ptr = const_cast<float*>(mat2d.ptr<float>(static_cast<int64_t>(row) * dim));
@@ -21,7 +21,7 @@ static tensor::Tensor row_view_fp32(const tensor::Tensor& mat2d, int32_t row, in
   v.set_device_type(device_type);
   return v;
 }
-
+// 把里面所有层转到cuda
 void LLama2Layers::to_cuda(std::shared_ptr<kernel::CudaConfig> config) {
   if (add_layer_) {
     add_layer_->set_cuda_config(config);
@@ -114,7 +114,7 @@ LLama2Model::LLama2Model(base::TokenizerType tokenizer_type, std::string token_p
                          std::string model_path, bool is_quant_model)
     : Model(tokenizer_type, base::ModelType::kModelTypeLLama2, std::move(token_path),
             std::move(model_path), is_quant_model) {}
-
+// 初始化
 base::Status LLama2Model::init(base::DeviceType device_type) {
   using namespace base;
   if (token_path_.empty()) {
@@ -135,11 +135,13 @@ base::Status LLama2Model::init(base::DeviceType device_type) {
     }
   }
 
+  // mmap映射
   Status read_status = gen_model_from_file();
   if (!read_status) {
     return read_status;
   }
   init_mem();
+  // 旋转位置编码提前准备
   if (device_type_ == base::DeviceType::kDeviceCPU) {
     kernel::sin_cos_cache_calc_cpu(config_->head_size_, config_->seq_len_,
                                    get_buffer(ModelBufferType::kSinCache).ptr<float>(),
@@ -234,43 +236,6 @@ base::Status LLama2Model::prefill(const tensor::Tensor& input, const tensor::Ten
       CHECK_NE(wo_layer, nullptr);
       STATUS_CHECK(wo_layer->forward(mha2d, attn2d));
 
-      // 后面 FFN 想最小侵入：先按 token 循环做 row-view，复用原 feed_forward（我可以下一条给你
-      // row-view 代码）
-      // ===== FFN：不分配 hidden_dim 2D，按 token 循环走原 1D buffer =====
-      // for (int32_t t = 0; t < token_num; ++t) {
-      //   tensor::Tensor input_row = row_view_fp32(input, t, config_->dim_, device_type_);
-      //   tensor::Tensor attn_row = row_view_fp32(attn2d, t, config_->dim_, device_type_);
-
-      //   // residual add: input_row += attn_row
-      //   CHECK_NE(llama_layers_->add_layer_, nullptr);
-      //   STATUS_CHECK(llama_layers_->add_layer_->forward(input_row, attn_row, input_row));
-
-      //   // 后面完全复用你原 feed_forward 的逻辑/缓冲区（1D）
-      //   tensor::Tensor ffn_norm = get_buffer(ModelBufferType::kFFNRMSNorm);
-      //   const auto& ffn_rms = llama_layers_->rmsnorm_layers_.at(layer_idx + config_->layer_num_);
-      //   CHECK_NE(ffn_rms, nullptr);
-      //   STATUS_CHECK(ffn_rms->forward(input_row, ffn_norm));
-
-      //   tensor::Tensor w1_out = get_buffer(ModelBufferType::kW1Output);
-      //   tensor::Tensor w3_out = get_buffer(ModelBufferType::kW3Output);
-      //   const auto& w1 = llama_layers_->w1_layers_.at(layer_idx);
-      //   const auto& w3 = llama_layers_->w3_layers_.at(layer_idx);
-      //   CHECK_NE(w1, nullptr);
-      //   CHECK_NE(w3, nullptr);
-      //   STATUS_CHECK(w1->forward(ffn_norm, w1_out));
-      //   STATUS_CHECK(w3->forward(ffn_norm, w3_out));
-
-      //   CHECK_NE(llama_layers_->swiglu_layer_, nullptr);
-      //   STATUS_CHECK(llama_layers_->swiglu_layer_->forward(w1_out, w3_out, w1_out));
-
-      //   tensor::Tensor w2_out = get_buffer(ModelBufferType::kW2Output);
-      //   const auto& w2 = llama_layers_->w2_layers_.at(layer_idx);
-      //   CHECK_NE(w2, nullptr);
-      //   STATUS_CHECK(w2->forward(w1_out, w2_out));
-
-      //   // residual add: input_row += w2_out
-      //   STATUS_CHECK(llama_layers_->add_layer_->forward(input_row, w2_out, input_row));
-      // }
       // ===== FFN (2D) =====
       // residual add: input += attn2d
       CHECK_NE(llama_layers_->add_layer_, nullptr);
@@ -598,7 +563,8 @@ void LLama2Model::create_param_layers() {
   rms_final_layer->set_weight(0, {config_->dim_}, weight_rmsnorm_final, cpu_device_type);
   llama_layers_->rmsnorm_layers_.push_back(rms_final_layer);
 }
-
+// 初始化内存空间（包括前向推理的输入输出缓冲区、kv cache 缓冲区，以及 prefill block 可能用到的 2D
+// 临时缓冲区）
 void LLama2Model::init_mem() {
   std::shared_ptr<base::DeviceAllocator> alloc;
   if (device_type_ == base::DeviceType::kDeviceCPU) {
@@ -779,7 +745,7 @@ base::Status LLama2Model::create_layers() {
   }
   return error::Success();
 }
-
+// 嵌入层
 op::EmbeddingOutput LLama2Model::embedding(const std::vector<int>& tokens) const {
   auto input_tokens = get_buffer(ModelBufferType::kInputTokens);
   auto input_embeddings = get_buffer(ModelBufferType::kInputEmbeddings);
@@ -812,13 +778,13 @@ void LLama2Model::attention_rms(int32_t layer_idx, const tensor::Tensor& input) 
   }
   STATUS_CHECK(rmsnorm_layer->forward(input, rmsnorm_output));
 }
-
+// 得到kqv向量
 void LLama2Model::attention_qkv(int32_t layer_idx, const tensor::Tensor& pos_tensor) const {
   CHECK(llama_layers_ != nullptr);
   // kv cache
   tensor::Tensor query = this->get_buffer(ModelBufferType::kQuery);
   int32_t pos = pos_tensor.index<int32_t>(0);
-  // wq wk wv @ input
+  // wq wk wv @ input  kvcache缓存
   const auto& [key, val] = slice_kv_cache(layer_idx, pos);
   // query
   const auto& query_layer = llama_layers_->wq_layers_.at(layer_idx);
@@ -959,13 +925,14 @@ void LLama2Model::feed_forward(int32_t layer_idx, const tensor::Tensor& input) c
       << "The add layer in the feedforward block is null pointer";
   STATUS_CHECK(llama_layers_->add_layer_->forward(input, w2_output, input));
 }
-
+// 生成 Logits（对数概率）的函数，是 LLM 推理的最后一步，将隐藏状态转换为词表概率分布。
 void LLama2Model::cls_logits(const tensor::Tensor& input) const {
+  // rmsnorm
   CHECK(llama_layers_ != nullptr);
   const auto& norm = llama_layers_->rmsnorm_layers_.at(2 * config_->layer_num_);
   CHECK_NE(norm, nullptr);
   STATUS_CHECK(norm->forward(input, input));
-
+  //
   tensor::Tensor forward_output = get_buffer(ModelBufferType::kForwardOutput);
   CHECK_NE(llama_layers_->cls_layer_, nullptr);
   STATUS_CHECK(llama_layers_->cls_layer_->forward(input, forward_output));

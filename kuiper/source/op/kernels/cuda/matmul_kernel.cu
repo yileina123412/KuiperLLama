@@ -152,33 +152,6 @@ __global__ void matmul_kernel_cu_qint8_batch(const float* input, const int8_t* w
   if (tid == 0) output[(size_t)b * K + k] = ssum[0];
 }
 
-// void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
-//                       const tensor::Tensor& output, const float scale, const CudaConfig* config)
-//                       {
-//   // 检查input和weight
-//   CHECK(input.is_empty() == false && input.dims_size() <= 2);
-//   CHECK(input.device_type() == base::DeviceType::kDeviceCUDA);
-
-//   CHECK(weight.is_empty() == false && weight.dims_size() == 2);
-//   CHECK(weight.device_type() == base::DeviceType::kDeviceCUDA);
-//   // 确认矩阵的形状
-//   const int32_t K = weight.get_dim(0);  // row
-//   const int32_t M = weight.get_dim(1);  // col  input
-//   int packet_size = 4;
-//   // CHECK_EQ(M % packet_size, 0);
-
-//   // 检查是否符合矩阵乘法的条件
-//   CHECK_EQ(M, input.get_dim(0));
-//   if (config && config->stream) {
-//     // 用输出的维度作为grid 每个block负责权重矩阵的一行
-//     matmul_kernel_cu_fp32<128, 1><<<K, 128, 0, config->stream>>>(
-//         input.ptr<float>(), weight.ptr<float>(), const_cast<float*>(output.ptr<float>()), M, K);
-//   } else {
-//     matmul_kernel_cu_fp32<128, 1><<<K, 128>>>(input.ptr<float>(), weight.ptr<float>(),
-//                                               const_cast<float*>(output.ptr<float>()), M, K);
-//   }
-// }
-
 void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
                       const tensor::Tensor& output, const float scale, const CudaConfig* config) {
   CHECK(!input.is_empty() && input.dims_size() <= 2);
@@ -246,19 +219,6 @@ void matmul_kernel_cu_qint8(const tensor::Tensor& input, const tensor::Tensor& w
   CHECK(weight.device_type() == base::DeviceType::kDeviceCUDA);
   const int32_t K = weight.get_dim(0);  // row
   const int32_t M = weight.get_dim(1);  // col
-  // int packet_size = 4;
-  // CHECK_EQ(M % packet_size, 0);
-  // CHECK_EQ(M, input.get_dim(0));
-
-  // if (config->stream) {
-  //   matmul_kernel_cu_fp32int8<128, 1><<<K, 128, 0, config->stream>>>(
-  //       input.ptr<float>(), weight.ptr<int8_t>(), scale.ptr<float>(), group_size,
-  //       const_cast<float*>(output.ptr<float>()), M, K);
-  // } else {
-  //   matmul_kernel_cu_fp32int8<128, 1><<<K, 128>>>(input.ptr<float>(), weight.ptr<int8_t>(),
-  //                                                 scale.ptr<float>(), group_size,
-  //                                                 const_cast<float*>(output.ptr<float>()), M, K);
-  // }
 
   // 1D: [M] -> [K]（decode）
   if (input.dims_size() == 1) {

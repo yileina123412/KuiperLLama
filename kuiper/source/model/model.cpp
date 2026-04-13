@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+
 namespace model {
 Model::Model(base::TokenizerType tokenizer_type, base::ModelType model_type, std::string token_path,
              std::string model_path, bool is_quant_model)
@@ -9,7 +10,9 @@ Model::Model(base::TokenizerType tokenizer_type, base::ModelType model_type, std
       model_type_(model_type),
       token_path_(std::move(token_path)),
       model_path_(std::move(model_path)),
-      is_quant_model_(is_quant_model) {}
+      is_quant_model_(is_quant_model) {
+  quant_format_ = is_quant_model_ ? QuantFormat::kInt8Q8 : QuantFormat::kNone;
+}
 
 base::ModelType Model::model_type() const { return model_type_; }
 
@@ -70,6 +73,7 @@ base::Status Model::read_model_file() {
           "file.");
     }
   }
+
   // 生成模型详细参数，将读取的配置转换为内部使用的详细参数
   auto gen_status = generate_model_infos(config);
   if (!gen_status) {
@@ -144,7 +148,7 @@ base::Status Model::generate_model_infos(const ModelConfig& config) const {
   config_->vocab_size_ = std::abs(config.vocab_size);
   return base::error::Success();
 }
-
+// 创建encode
 base::Status Model::create_encode_layer() {
   using namespace base;
 

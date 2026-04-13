@@ -2,6 +2,7 @@
 #include "kernels/cpu/matmul_kernel.h"
 #include "kernels/kernels_interface.h"
 namespace op {
+// weight 维度：[dim0_, dim1_]
 MatmulLayer::MatmulLayer(base::DeviceType device_type, int32_t dim0, int32_t dim1,
                          bool is_quant_layer, bool has_bias)
     : LayerParam(device_type, LayerType::kLayerMatmul, is_quant_layer, "Matmul"),
@@ -15,7 +16,7 @@ MatmulLayer::MatmulLayer(base::DeviceType device_type, int32_t dim0, int32_t dim
     bias_.resize(1);
   }
 }
-
+// 检查输入输出张量和权重的维度、数据类型和设备类型是否合法
 base::Status MatmulLayer::check() const {
   const auto input = get_input(0);
   const auto output = get_output(0);
@@ -45,7 +46,7 @@ base::Status MatmulLayer::check() const {
     return base::error::InvalidArgument("Matmul only supports 1D/2D input");
   }
 
-  // weight check（保持你原逻辑）
+  // weight check
   if (!is_quant_layer_) {
     auto status = check_tensor_with_dim(get_weight(0), device_type_, data_type_, dim0_, dim1_);
     if (!status) return status;

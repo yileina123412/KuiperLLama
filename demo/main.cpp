@@ -65,6 +65,7 @@ int32_t generate1(const model::LLama2Model& model, const std::string& sentence, 
 int32_t generate(const model::LLama2Model& model, const std::string& sentence, int total_steps,
                  bool need_output = false) {
   auto start_time = std::chrono::steady_clock::now();
+  // 进行文本编码，得到 token 序列
   auto tokens = model.encode(sentence);
 
   int32_t prompt_len = tokens.size();
@@ -74,7 +75,7 @@ int32_t generate(const model::LLama2Model& model, const std::string& sentence, i
 
   int32_t pos = 0;
   int32_t next = -1;
-  bool is_prompt = false;  // 我们改成：prompt 一次性 prefill，while 里只有 decode
+  bool is_prompt = false;  // 改成：prompt 一次性 prefill，while 里只有 decode
 
   std::vector<int32_t> words;
 
@@ -151,11 +152,13 @@ int main(int argc, char* argv[]) {
   //     "/home/furina/code_learnning/cpp/cuda/KuiperLLama/models/tokenizer.json";
 
   model::LLama2Model model(base::TokenizerType::kEncodeSpe, tokenizer_path, checkpoint_path, true);
+  // auto init_status = model.init(base::DeviceType::kDeviceCPU);
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
   if (!init_status) {
     LOG(FATAL) << "The model init failed, the error code is: " << init_status.get_err_code();
   }
-  const std::string& sentence = "this is a test,please answer me in English.";
+  const std::string& sentence = "this";
+  // const std::string& sentence = "this is a test,please answer me in English.";
 
   auto start = std::chrono::steady_clock::now();
   printf("Generating...\n");

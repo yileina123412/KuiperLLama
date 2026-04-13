@@ -4,21 +4,29 @@
 #include <string>
 #include <vector>
 
+// Unicode 和 UTF-8 的转换是一个纯粹的数学算法，它不需要查表
+// 将磁盘上的 UTF-8 字节流转成程序好处理的 Unicode 码点序列。
+
 // 这是一个 Unicode 文本预处理引擎,专门为 Tokenizer (分词器)
 // 提供底层的字符编码转换和正则表达式分割功能。
 // TODO: prefix all symbols with "llama_"
 
+// 文本预处理和分词的基础组件
+
+// 把原始字符串修改成分词器可以用的格式
+// 字符分类标志常量
 struct codepoint_flags {
+  // 支持一个字符拥有多个属性
   enum {
-    UNDEFINED = 0x0001,
-    NUMBER = 0x0002,       // regex: \p{N}
-    LETTER = 0x0004,       // regex: \p{L}
-    SEPARATOR = 0x0008,    // regex: \p{Z}
-    ACCENT_MARK = 0x0010,  // regex: \p{M}
-    PUNCTUATION = 0x0020,  // regex: \p{P}
-    SYMBOL = 0x0040,       // regex: \p{S}
-    CONTROL = 0x0080,      // regex: \p{C}
-    MASK_CATEGORIES = 0x00FF,
+    UNDEFINED = 0x0001,        // 未定义的字符
+    NUMBER = 0x0002,           // regex: \p{N} 数字字符
+    LETTER = 0x0004,           // regex: \p{L}  字母字符（a-z, A-Z, 中文等）
+    SEPARATOR = 0x0008,        // regex: \p{Z}  分隔符（空格、换行等）
+    ACCENT_MARK = 0x0010,      // regex: \p{M}
+    PUNCTUATION = 0x0020,      // regex: \p{P}
+    SYMBOL = 0x0040,           // regex: \p{S}  数学/货币符号（$, +, = 等）
+    CONTROL = 0x0080,          // regex: \p{C}
+    MASK_CATEGORIES = 0x00FF,  // 掩码：提取前8位（所有分类标记）
   };
 
   // codepoint type
