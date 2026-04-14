@@ -139,8 +139,11 @@ int main(int argc, char* argv[]) {
   // const char* tokenizer_path = argv[2];
   // const char* checkpoint_path =
   //     "/home/furina/code_learnning/cpp/cuda/KuiperLLama/models/stories110M.bin";  // e.g.
+  // const char* checkpoint_path =
+  //     "/home/furina/code_learnning/cpp/cuda/KuiperLLama/models/tinyllama_int8.bin";  // e.g.
   const char* checkpoint_path =
-      "/home/furina/code_learnning/cpp/cuda/KuiperLLama/models/tinyllama_int8.bin";  // e.g.
+      "/home/furina/code_learnning/cpp/cuda/KuiperLLama/models/llama2_7b_smooth_pro_v3.bin";  //
+  //     e.g.
 
   const char* tokenizer_path =
       "/home/furina/code_learnning/cpp/cuda/KuiperLLama/models/tokenizer.model";
@@ -151,8 +154,10 @@ int main(int argc, char* argv[]) {
   // const char* tokenizer_path =
   //     "/home/furina/code_learnning/cpp/cuda/KuiperLLama/models/tokenizer.json";
 
-  model::LLama2Model model(base::TokenizerType::kEncodeSpe, tokenizer_path, checkpoint_path, true);
-  // auto init_status = model.init(base::DeviceType::kDeviceCPU);
+  model::LLama2Model model(base::TokenizerType::kEncodeSpe, tokenizer_path, checkpoint_path, true,
+                           model::Model::QuantFormat::kSQ4);
+  // model::LLama2Model model(base::TokenizerType::kEncodeSpe, tokenizer_path, checkpoint_path,
+  // true); auto init_status = model.init(base::DeviceType::kDeviceCPU);
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
   if (!init_status) {
     LOG(FATAL) << "The model init failed, the error code is: " << init_status.get_err_code();

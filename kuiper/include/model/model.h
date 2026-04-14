@@ -24,9 +24,18 @@
 namespace model {
 class Model {
  public:
+  enum class QuantFormat : uint8_t {
+    kNone = 0,
+    kInt8Q8 = 1,
+    kAwq4 = 2,  // 预留/历史
+    kSQ4 = 3,   // SmoothQuant + RTN 4bit（对应你的 export_smooth_rtn_pro_v3.py）
+  };
+
+  QuantFormat quant_format() const { return quant_format_; }
   // 构造函数  初始化模型的基本信息，设置模型类型，文件路径以及是否量化等参数
   explicit Model(base::TokenizerType tokenizer_type, base::ModelType model_type,
-                 std::string token_path, std::string model_path, bool is_quant_model);
+                 std::string token_path, std::string model_path, bool is_quant_model,
+                 QuantFormat quant_format = QuantFormat::kInt8Q8);
 
   virtual base::Status init(base::DeviceType device_type) = 0;
   // predict: 完整的预测流程（包含后处理）
@@ -107,12 +116,6 @@ class Model {
   int32_t group_size_ = 1;
   // 是否为量化模型
   bool is_quant_model_ = false;
-
-  enum class QuantFormat : uint8_t {
-    kNone = 0,
-    kInt8Q8 = 1,
-    kAwq4 = 2,
-  };
 
   QuantFormat quant_format_ = QuantFormat::kNone;
 

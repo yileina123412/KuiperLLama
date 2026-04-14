@@ -2,6 +2,7 @@
 #include <cuda_runtime_api.h>
 #include <glog/logging.h>
 #include <op/matmul.h>
+#include <op/matmul_sq4.h>
 #include <op/mha.h>
 #include <op/rmsnorm.h>
 #include <sentencepiece_processor.h>
@@ -111,9 +112,9 @@ void LLama2Layers::to_cuda(std::shared_ptr<kernel::CudaConfig> config) {
 }
 
 LLama2Model::LLama2Model(base::TokenizerType tokenizer_type, std::string token_path,
-                         std::string model_path, bool is_quant_model)
+                         std::string model_path, bool is_quant_model, QuantFormat quant_format)
     : Model(tokenizer_type, base::ModelType::kModelTypeLLama2, std::move(token_path),
-            std::move(model_path), is_quant_model) {}
+            std::move(model_path), is_quant_model, quant_format) {}
 // 初始化
 base::Status LLama2Model::init(base::DeviceType device_type) {
   using namespace base;
@@ -326,6 +327,179 @@ void LLama2Model::create_nonparam_layers() {
 void LLama2Model::create_param_quant_layers() {
   CHECK(is_quant_model_);
   CHECK(llama_layers_ != nullptr);
+
+  if (quant_format() == QuantFormat::kSQ4) {
+    auto cpu_device_type = base::DeviceType::kDeviceCPU;
+
+    const uint8_t* begin = reinterpret_cast<const uint8_t*>(raw_model_data_->weight_data);
+    const uint8_t* end =
+        reinterpret_cast<const uint8_t*>(raw_model_data_->data) + raw_model_data_->file_size;
+
+    model::QuantBlockCursor cursor(begin, end);
+
+    const int32_t dim = config_->dim_;
+    const int32_t hidden_dim = config_->hidden_dim_;
+
+    auto read_sq4_matmul = [&](int32_t rows, int32_t cols) -> std::shared_ptr<op::Layer> {
+      model::QuantBlockPayload payload;
+      STATUS_CHECK(cursor.ReadNextSQ4(rows, cols, group_size_, &payload, true));
+
+      // // ---- DEBUG: dump first SQ4 block (expected WQ_0) ----
+      // static bool dumped = false;
+      // if (!dumped) {
+      //   dumped = true;
+
+      //   const auto& d = payload.desc;
+      //   LOG(INFO) << "[SQ4 DUMP] first block desc: type=" << d.block_type << " rows=" << d.rows
+      //             << " cols=" << d.cols << " q_size=" << d.q_size << " s_size=" << d.s_size
+      //             << " z_size=" << d.z_size << " group=" << d.group_size;
+
+      //   auto load_nibble = [](const uint8_t* p, size_t idx) -> uint8_t {
+      //     const uint8_t byte = p[idx >> 1];
+      //     return (idx & 1) ? (byte >> 4) : (byte & 0x0F);
+      //   };
+
+      //   const int32_t M = d.cols;
+      //   const int32_t gsz = d.group_size;
+      //   CHECK_GT(M, 0);
+      //   CHECK_GT(gsz, 0);
+      //   CHECK_EQ(M % gsz, 0);
+
+      //   const int32_t groups_per_row = M / gsz;
+
+      //   // row0, group0
+      //   const size_t g0 = 0;  // k=0, group=0
+      //   const uint8_t z0 = load_nibble(payload.z, g0);
+      //   const float s0 = reinterpret_cast<const float*>(payload.s)[g0];
+
+      //   LOG(INFO) << "[SQ4 DUMP] row0 group0: z0=" << int(z0) << " s0=" << s0;
+
+      //   for (int i = 0; i < 16; ++i) {
+      //     const size_t w_idx =
+      //         static_cast<size_t>(0) * static_cast<size_t>(M) + static_cast<size_t>(i);
+      //     const uint8_t q4 = load_nibble(payload.q, w_idx);
+      //     const float w = (float(int(q4) - int(z0))) * s0;
+      //     LOG(INFO) << "[SQ4 DUMP] w(0," << i << "): q4=" << int(q4) << " deq=" << w;
+      //   }
+
+      //   // sanity: group index check for i=0..15 should all be group 0
+      //   for (int i = 0; i < 16; ++i) {
+      //     CHECK_EQ(i / gsz, 0);
+      //     CHECK_EQ(groups_per_row, M / gsz);
+      //   }
+      // }
+
+      op::SQ4WeightView view;
+      view.rows = payload.desc.rows;
+      view.cols = payload.desc.cols;
+      view.group_size = payload.desc.group_size;
+
+      view.qweight_packed = payload.q;
+      view.q_bytes = static_cast<size_t>(payload.desc.q_size);
+
+      view.scales = payload.s;
+      view.s_bytes = static_cast<size_t>(payload.desc.s_size);
+
+      view.zeros_packed = payload.z;
+      view.z_bytes = static_cast<size_t>(payload.desc.z_size);
+
+      auto layer = std::make_shared<op::MatmulSQ4Layer>(device_type_, rows, cols);
+      STATUS_CHECK(layer->set_sq4_weight(view, cpu_device_type, true));
+      return layer;
+    };
+
+    // WQ
+    for (int32_t i = 0; i < config_->layer_num_; ++i) {
+      llama_layers_->wq_layers_.push_back(read_sq4_matmul(dim, dim));
+    }
+    // WK
+    for (int32_t i = 0; i < config_->layer_num_; ++i) {
+      llama_layers_->wk_layers_.push_back(read_sq4_matmul(config_->kv_dim_, dim));
+    }
+    // WV
+    for (int32_t i = 0; i < config_->layer_num_; ++i) {
+      llama_layers_->wv_layers_.push_back(read_sq4_matmul(config_->kv_dim_, dim));
+    }
+    // WO
+    for (int32_t i = 0; i < config_->layer_num_; ++i) {
+      llama_layers_->wo_layers_.push_back(read_sq4_matmul(dim, dim));
+    }
+    // W1
+    for (int32_t i = 0; i < config_->layer_num_; ++i) {
+      llama_layers_->w1_layers_.push_back(read_sq4_matmul(hidden_dim, dim));
+    }
+    // W2
+    for (int32_t i = 0; i < config_->layer_num_; ++i) {
+      llama_layers_->w2_layers_.push_back(read_sq4_matmul(dim, hidden_dim));
+    }
+    // W3
+    for (int32_t i = 0; i < config_->layer_num_; ++i) {
+      llama_layers_->w3_layers_.push_back(read_sq4_matmul(hidden_dim, dim));
+    }
+
+    // lm_head / cls
+    // llama_layers_->cls_layer_ = read_sq4_matmul(config_->vocab_size_, dim);
+    if (config_->is_shared_weight_) {
+      size_t skipped = 0;
+      STATUS_CHECK(cursor.SkipNext(&skipped));  // 仍然消费掉 exporter 写入的 lm_head SQ4 block
+      LOG(INFO) << "SQ4: skipped lm_head SQ4 block bytes=" << skipped
+                << " (use fp32 tied embedding for cls)";
+      // cls_layer_ 会在 embedding weight_ptr 就绪后再绑定
+    } else {
+      llama_layers_->cls_layer_ = read_sq4_matmul(config_->vocab_size_, dim);
+    }
+
+    // ---- Step 7: 常数区（embedding + norms）对齐/边界/校验 ----
+    // 接下来应当是 fp32 embedding + rmsnorm
+    const size_t off = cursor.offset_bytes_from(begin);
+    const size_t align = 16;  // 对应 exporter: _write_align_padding(f, 16)
+    const size_t pad = (align - (off % align)) % align;
+
+    const size_t emb_floats =
+        static_cast<size_t>(std::abs(config_->vocab_size_)) * static_cast<size_t>(dim);
+    const size_t norm_floats =
+        static_cast<size_t>(2 * config_->layer_num_ + 1) * static_cast<size_t>(dim);
+    const size_t const_bytes = (emb_floats + norm_floats) * sizeof(float);
+
+    CHECK(cursor.remaining_bytes() >= pad + const_bytes)
+        << "SQ4: not enough bytes for fp32 constants region";
+
+    // 可选但推荐：验证 padding 全为 0（更容易定位导出/读取顺序错误）
+    const uint8_t* p0 = cursor.ptr();
+    for (size_t i = 0; i < pad; ++i) {
+      CHECK_EQ(p0[i], 0) << "SQ4: non-zero padding byte, bin may be corrupted";
+    }
+
+    float* weight_ptr = reinterpret_cast<float*>(const_cast<uint8_t*>(cursor.ptr() + pad));
+    CHECK_EQ(reinterpret_cast<uintptr_t>(weight_ptr) % alignof(float), 0)
+        << "SQ4: fp32 constants not aligned to float";
+
+    // embedding
+    llama_layers_->embedding_layer_ = std::make_shared<op::EmbeddingLayer>(
+        device_type_, config_->dim_, config_->seq_len_, std::abs(config_->vocab_size_));
+    llama_layers_->embedding_layer_->set_weight(0, {std::abs(config_->vocab_size_), dim},
+                                                weight_ptr, cpu_device_type);
+
+    if (config_->is_shared_weight_) {
+      auto cls = std::make_shared<op::MatmulLayer>(device_type_, config_->vocab_size_, dim, false);
+      cls->set_weight(0, {config_->vocab_size_, dim}, weight_ptr, cpu_device_type);
+      llama_layers_->cls_layer_ = cls;
+    }
+
+    weight_ptr += static_cast<size_t>(config_->vocab_size_) * static_cast<size_t>(dim);
+
+    // rmsnorm attention/ffn/final: 2*layer_num + 1
+    for (int32_t i = 0; i < 2 * config_->layer_num_ + 1; ++i) {
+      auto rms_norm_layer = std::make_shared<op::RmsNormLayer>(device_type_, dim);
+      rms_norm_layer->set_weight(0, {dim}, weight_ptr, cpu_device_type);
+      llama_layers_->rmsnorm_layers_.push_back(rms_norm_layer);
+      weight_ptr += dim;
+    }
+    CHECK(weight_ptr <= reinterpret_cast<float*>(const_cast<uint8_t*>(end)))
+        << "SQ4: constants region overflow";
+
+    return;
+  }
 
   size_t pos = 0;
   int32_t dim = config_->dim_;

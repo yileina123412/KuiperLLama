@@ -33,7 +33,8 @@ struct Qwen2Layers {
 class Qwen2Model : public Model {
  public:
   explicit Qwen2Model(base::TokenizerType tokenizer_type, std::string token_path,
-                      std::string model_path, bool is_quant_model);
+                      std::string model_path, bool is_quant_model,
+                      QuantFormat quant_format = QuantFormat::kInt8Q8);
 
   base::Status init(base::DeviceType device_type) override;
 

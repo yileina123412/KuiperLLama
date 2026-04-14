@@ -99,17 +99,26 @@ def main():
         max_calib_seq_len=args.seqlen
     )
 
+
     # 4. 获取内核模型
     llama_for_causal = model.model # LlamaForCausalLM
     llama_model = llama_for_causal.model # LlamaModel
     hf_cfg = llama_for_causal.config
     layers = list(llama_model.layers)
 
+    p = layers[0].self_attn.q_proj
+    print("qweight shape:", tuple(p.qweight.shape), "dtype:", p.qweight.dtype)
+    print("qzeros  shape:", tuple(p.qzeros.shape),  "dtype:", p.qzeros.dtype)
+    print("scales  shape:", tuple(p.scales.shape),  "dtype:", p.scales.dtype)
+
     # 5. 准备 Header 参数
     dim = int(hf_cfg.hidden_size)
     hidden_dim = int(hf_cfg.intermediate_size)
     vocab_size_flag = -abs(int(hf_cfg.vocab_size)) # 负数标志
     seq_len = int(hf_cfg.max_position_embeddings)
+
+    seq_len = 2048 
+    print(f"警告：已将 max_seq_len 从 {hf_cfg.max_position_embeddings} 限制为 {seq_len} 以节省显存")
 
     print(f"量化完成，开始写入带有描述符的二进制文件...")
 

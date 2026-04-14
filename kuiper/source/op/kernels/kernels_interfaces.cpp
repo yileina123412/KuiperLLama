@@ -12,6 +12,7 @@
 #include "cuda/add_kernel.cuh"
 #include "cuda/emb_kernel.cuh"
 #include "cuda/matmul_kernel.cuh"
+#include "cuda/matmul_sq4_kernel.cuh"
 #include "cuda/mha_kernel.cuh"
 #include "cuda/rmsnorm_kernel.cuh"
 #include "cuda/rope_kernel.cuh"
@@ -56,6 +57,15 @@ MatmulKernelQuant get_matmul_kernel_quant8(base::DeviceType device_type) {
     return matmul_kernel_cu_qint8;
   } else {
     LOG(FATAL) << "Unknown device type for get an matmul kernel.";
+    return nullptr;
+  }
+}
+
+MatmulKernelSQ4 get_matmul_kernel_sq4(base::DeviceType device_type) {
+  if (device_type == base::DeviceType::kDeviceCUDA) {
+    return matmul_kernel_cu_sq4;
+  } else {
+    LOG(FATAL) << "Unknown device type for get a sq4 matmul kernel.";
     return nullptr;
   }
 }

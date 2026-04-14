@@ -1,7 +1,9 @@
 #ifndef KUIPER_INCLUDE_MODEL_LLAMA_H_
 #define KUIPER_INCLUDE_MODEL_LLAMA_H_
 #include <base/cuda_config.h>
+#include "base/buffer.h"
 #include "model.h"
+#include "model/quant_cursor.h"
 #include "op/add.h"
 #include "op/embedding.h"
 #include "op/rope.h"
@@ -40,7 +42,8 @@ struct LLama2Layers {
 class LLama2Model : public Model {
  public:
   explicit LLama2Model(base::TokenizerType tokenizer_type, std::string token_path,
-                       std::string model_path, bool is_quant_model);
+                       std::string model_path, bool is_quant_model,
+                       QuantFormat quant_format = QuantFormat::kInt8Q8);
 
   base::Status init(base::DeviceType device_type) override;
 

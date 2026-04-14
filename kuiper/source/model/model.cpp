@@ -5,13 +5,18 @@
 
 namespace model {
 Model::Model(base::TokenizerType tokenizer_type, base::ModelType model_type, std::string token_path,
-             std::string model_path, bool is_quant_model)
+             std::string model_path, bool is_quant_model, QuantFormat quant_format)
     : tokenizer_type_(tokenizer_type),
       model_type_(model_type),
       token_path_(std::move(token_path)),
       model_path_(std::move(model_path)),
       is_quant_model_(is_quant_model) {
-  quant_format_ = is_quant_model_ ? QuantFormat::kInt8Q8 : QuantFormat::kNone;
+  if (!is_quant_model_) {
+    quant_format_ = QuantFormat::kNone;
+  } else {
+    // 兼容：如果调用方没传/误传 kNone，就仍然按原来的 int8 走
+    quant_format_ = (quant_format == QuantFormat::kNone) ? QuantFormat::kInt8Q8 : quant_format;
+  }
 }
 
 base::ModelType Model::model_type() const { return model_type_; }

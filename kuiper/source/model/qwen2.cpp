@@ -100,9 +100,9 @@ void Qwen2Layers::to_cuda(std::shared_ptr<kernel::CudaConfig> config) {
 }
 
 Qwen2Model::Qwen2Model(base::TokenizerType tokenizer_type, std::string token_path,
-                       std::string model_path, bool is_quant_model)
+                       std::string model_path, bool is_quant_model, QuantFormat quant_format)
     : Model(tokenizer_type, base::ModelType::kModelTypeLLama2, std::move(token_path),
-            std::move(model_path), is_quant_model) {}
+            std::move(model_path), is_quant_model, quant_format) {}
 
 base::Status Qwen2Model::init(base::DeviceType device_type) {
   using namespace base;
@@ -722,7 +722,6 @@ op::EmbeddingOutput Qwen2Model::embedding(const std::vector<int>& tokens) const 
   op::EmbeddingOutput output(input_tokens, input_embeddings, input_token_num);
   return output;
 }
-
 
 void Qwen2Model::cls_logits(const tensor::Tensor& input) const {
   CHECK(qwen_layers_ != nullptr);
