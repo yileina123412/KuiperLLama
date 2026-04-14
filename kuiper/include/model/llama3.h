@@ -1,6 +1,7 @@
 #ifndef KUIPER_INCLUDE_MODEL_LLAMA_H_
 #define KUIPER_INCLUDE_MODEL_LLAMA_H_
 #include <base/cuda_config.h>
+#include <unordered_set>
 #include "base/buffer.h"
 #include "model.h"
 #include "model/quant_cursor.h"
@@ -35,6 +36,8 @@ struct LLama2Layers {
   std::shared_ptr<op::Layer> cls_layer_;  // 分类输出层
 
   std::shared_ptr<op::Layer> embedding_layer_;  // 词嵌入输出层
+
+  std::vector<std::shared_ptr<base::Buffer>> owned_fp32_weights_;
 
   void to_cuda(std::shared_ptr<kernel::CudaConfig> config);
 };

@@ -9,6 +9,7 @@
 #include <utility>
 #include "../op/kernels/cpu/rope_kernel.h"
 #include "../op/kernels/cuda/rope_kernel.cuh"
+#include "base/alloc.h"
 #include "base/tick.h"
 namespace model {
 // 从 2D 张量中提取第 row 行，创建一个 1D 视图（View），避免数据复制。
@@ -331,6 +332,57 @@ void LLama2Model::create_param_quant_layers() {
   if (quant_format() == QuantFormat::kSQ4) {
     auto cpu_device_type = base::DeviceType::kDeviceCPU;
 
+    // Hybrid strategy: dequantize selected SQ4 weights into fp32 at load time.
+    // Env:
+    //   KUIPER_SQ4_DEQUANT: comma/space separated tags: wq,wk,wv,wo,w1,w2,w3,lm_head,all,none
+    //                      default: w2
+    //   KUIPER_SQ4_DEQUANT_LAST_N: only dequantize last N layers for per-layer matrices
+    //                             default: 1 (keeps VRAM increase bounded)
+    const char* env_cstr = std::getenv("KUIPER_SQ4_DEQUANT");
+    std::string env = env_cstr ? std::string(env_cstr) : std::string("w2");
+
+    const char* last_cstr = std::getenv("KUIPER_SQ4_DEQUANT_LAST_N");
+    int dequant_last_n = last_cstr ? std::atoi(last_cstr) : 1;
+
+    auto to_lower = [](std::string s) -> std::string {
+      for (char& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      return s;
+    };
+
+    auto split_tokens = [&](const std::string& s) -> std::unordered_set<std::string> {
+      std::unordered_set<std::string> out;
+      std::string cur;
+      for (char ch : s) {
+        if (ch == ',' || ch == ' ' || ch == '\t' || ch == ';' || ch == '|') {
+          if (!cur.empty()) {
+            out.insert(to_lower(cur));
+            cur.clear();
+          }
+        } else {
+          cur.push_back(ch);
+        }
+      }
+      if (!cur.empty()) out.insert(to_lower(cur));
+      return out;
+    };
+
+    const auto tokens = split_tokens(env);
+
+    auto should_dequant_tag = [&](const char* tag) -> bool {
+      if (!tag) return false;
+      if (tokens.count("none")) return false;
+      if (tokens.count("all")) return true;
+      return tokens.count(to_lower(std::string(tag))) > 0;
+    };
+
+    auto should_dequant_here = [&](const char* tag, int32_t layer_idx) -> bool {
+      if (!should_dequant_tag(tag)) return false;
+      if (layer_idx < 0) return true;        // e.g. lm_head
+      if (dequant_last_n <= 0) return true;  // <=0 means no restriction
+      const int32_t start = std::max<int32_t>(0, config_->layer_num_ - dequant_last_n);
+      return layer_idx >= start;
+    };
+
     const uint8_t* begin = reinterpret_cast<const uint8_t*>(raw_model_data_->weight_data);
     const uint8_t* end =
         reinterpret_cast<const uint8_t*>(raw_model_data_->data) + raw_model_data_->file_size;
@@ -340,54 +392,56 @@ void LLama2Model::create_param_quant_layers() {
     const int32_t dim = config_->dim_;
     const int32_t hidden_dim = config_->hidden_dim_;
 
-    auto read_sq4_matmul = [&](int32_t rows, int32_t cols) -> std::shared_ptr<op::Layer> {
+    auto read_sq4_matmul = [&](const char* tag, int32_t layer_idx, int32_t rows,
+                               int32_t cols) -> std::shared_ptr<op::Layer> {
       model::QuantBlockPayload payload;
       STATUS_CHECK(cursor.ReadNextSQ4(rows, cols, group_size_, &payload, true));
 
-      // // ---- DEBUG: dump first SQ4 block (expected WQ_0) ----
-      // static bool dumped = false;
-      // if (!dumped) {
-      //   dumped = true;
+      if (should_dequant_here(tag, layer_idx)) {
+        CHECK_GT(payload.desc.group_size, 0);
+        CHECK_EQ(payload.desc.cols % payload.desc.group_size, 0)
+            << "SQ4 dequant requires cols % group_size == 0";
 
-      //   const auto& d = payload.desc;
-      //   LOG(INFO) << "[SQ4 DUMP] first block desc: type=" << d.block_type << " rows=" << d.rows
-      //             << " cols=" << d.cols << " q_size=" << d.q_size << " s_size=" << d.s_size
-      //             << " z_size=" << d.z_size << " group=" << d.group_size;
+        const int32_t M = payload.desc.rows;
+        const int32_t K = payload.desc.cols;
+        const int32_t gsz = payload.desc.group_size;
+        const int32_t groups_per_row = K / gsz;
 
-      //   auto load_nibble = [](const uint8_t* p, size_t idx) -> uint8_t {
-      //     const uint8_t byte = p[idx >> 1];
-      //     return (idx & 1) ? (byte >> 4) : (byte & 0x0F);
-      //   };
+        const size_t bytes = static_cast<size_t>(M) * static_cast<size_t>(K) * sizeof(float);
+        auto cpu_alloc = base::CPUDeviceAllocatorFactory::get_instance();
+        auto owned = std::make_shared<base::Buffer>(bytes, cpu_alloc);
+        float* out = reinterpret_cast<float*>(owned->ptr());
+        CHECK_NE(out, nullptr);
 
-      //   const int32_t M = d.cols;
-      //   const int32_t gsz = d.group_size;
-      //   CHECK_GT(M, 0);
-      //   CHECK_GT(gsz, 0);
-      //   CHECK_EQ(M % gsz, 0);
+        auto load_nibble = [](const uint8_t* p, size_t idx) -> uint8_t {
+          const uint8_t byte = p[idx >> 1];
+          return (idx & 1) ? (byte >> 4) : (byte & 0x0F);
+        };
 
-      //   const int32_t groups_per_row = M / gsz;
+        const float* scales = reinterpret_cast<const float*>(payload.s);
+        for (int32_t r = 0; r < M; ++r) {
+          for (int32_t c = 0; c < K; ++c) {
+            const int32_t g = c / gsz;
+            const size_t group_idx = static_cast<size_t>(r) * static_cast<size_t>(groups_per_row) +
+                                     static_cast<size_t>(g);
+            const size_t w_idx =
+                static_cast<size_t>(r) * static_cast<size_t>(K) + static_cast<size_t>(c);
 
-      //   // row0, group0
-      //   const size_t g0 = 0;  // k=0, group=0
-      //   const uint8_t z0 = load_nibble(payload.z, g0);
-      //   const float s0 = reinterpret_cast<const float*>(payload.s)[g0];
+            const uint8_t q4 = load_nibble(payload.q, w_idx);
+            const uint8_t z4 = load_nibble(payload.z, group_idx);
+            const float s = scales[group_idx];
+            out[w_idx] = (static_cast<float>(int(q4) - int(z4))) * s;
+          }
+        }
 
-      //   LOG(INFO) << "[SQ4 DUMP] row0 group0: z0=" << int(z0) << " s0=" << s0;
+        llama_layers_->owned_fp32_weights_.push_back(owned);
 
-      //   for (int i = 0; i < 16; ++i) {
-      //     const size_t w_idx =
-      //         static_cast<size_t>(0) * static_cast<size_t>(M) + static_cast<size_t>(i);
-      //     const uint8_t q4 = load_nibble(payload.q, w_idx);
-      //     const float w = (float(int(q4) - int(z0))) * s0;
-      //     LOG(INFO) << "[SQ4 DUMP] w(0," << i << "): q4=" << int(q4) << " deq=" << w;
-      //   }
-
-      //   // sanity: group index check for i=0..15 should all be group 0
-      //   for (int i = 0; i < 16; ++i) {
-      //     CHECK_EQ(i / gsz, 0);
-      //     CHECK_EQ(groups_per_row, M / gsz);
-      //   }
-      // }
+        auto layer = std::make_shared<op::MatmulLayer>(device_type_, rows, cols, false);
+        STATUS_CHECK(layer->set_weight(0, {rows, cols}, out, cpu_device_type));
+        LOG(INFO) << "SQ4 hybrid: dequant->fp32 tag=" << (tag ? tag : "?") << " layer=" << layer_idx
+                  << " (" << rows << "x" << cols << ")";
+        return layer;
+      }
 
       op::SQ4WeightView view;
       view.rows = payload.desc.rows;
@@ -410,31 +464,31 @@ void LLama2Model::create_param_quant_layers() {
 
     // WQ
     for (int32_t i = 0; i < config_->layer_num_; ++i) {
-      llama_layers_->wq_layers_.push_back(read_sq4_matmul(dim, dim));
+      llama_layers_->wq_layers_.push_back(read_sq4_matmul("wq", i, dim, dim));
     }
     // WK
     for (int32_t i = 0; i < config_->layer_num_; ++i) {
-      llama_layers_->wk_layers_.push_back(read_sq4_matmul(config_->kv_dim_, dim));
+      llama_layers_->wk_layers_.push_back(read_sq4_matmul("wk", i, config_->kv_dim_, dim));
     }
     // WV
     for (int32_t i = 0; i < config_->layer_num_; ++i) {
-      llama_layers_->wv_layers_.push_back(read_sq4_matmul(config_->kv_dim_, dim));
+      llama_layers_->wv_layers_.push_back(read_sq4_matmul("wv", i, config_->kv_dim_, dim));
     }
     // WO
     for (int32_t i = 0; i < config_->layer_num_; ++i) {
-      llama_layers_->wo_layers_.push_back(read_sq4_matmul(dim, dim));
+      llama_layers_->wo_layers_.push_back(read_sq4_matmul("wo", i, dim, dim));
     }
     // W1
     for (int32_t i = 0; i < config_->layer_num_; ++i) {
-      llama_layers_->w1_layers_.push_back(read_sq4_matmul(hidden_dim, dim));
+      llama_layers_->w1_layers_.push_back(read_sq4_matmul("w1", i, hidden_dim, dim));
     }
     // W2
     for (int32_t i = 0; i < config_->layer_num_; ++i) {
-      llama_layers_->w2_layers_.push_back(read_sq4_matmul(dim, hidden_dim));
+      llama_layers_->w2_layers_.push_back(read_sq4_matmul("w2", i, dim, hidden_dim));
     }
     // W3
     for (int32_t i = 0; i < config_->layer_num_; ++i) {
-      llama_layers_->w3_layers_.push_back(read_sq4_matmul(hidden_dim, dim));
+      llama_layers_->w3_layers_.push_back(read_sq4_matmul("w3", i, hidden_dim, dim));
     }
 
     // lm_head / cls
@@ -446,7 +500,7 @@ void LLama2Model::create_param_quant_layers() {
                 << " (use fp32 tied embedding for cls)";
       // cls_layer_ 会在 embedding weight_ptr 就绪后再绑定
     } else {
-      llama_layers_->cls_layer_ = read_sq4_matmul(config_->vocab_size_, dim);
+      llama_layers_->cls_layer_ = read_sq4_matmul("lm_head", -1, config_->vocab_size_, dim);
     }
 
     // ---- Step 7: 常数区（embedding + norms）对齐/边界/校验 ----
