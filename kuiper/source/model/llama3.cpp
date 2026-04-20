@@ -328,16 +328,10 @@ void LLama2Model::create_nonparam_layers() {
 void LLama2Model::create_param_quant_layers() {
   CHECK(is_quant_model_);
   CHECK(llama_layers_ != nullptr);
-
+  // 单独写一个分支
   if (quant_format() == QuantFormat::kSQ4) {
     auto cpu_device_type = base::DeviceType::kDeviceCPU;
-
-    // Hybrid strategy: dequantize selected SQ4 weights into fp32 at load time.
-    // Env:
-    //   KUIPER_SQ4_DEQUANT: comma/space separated tags: wq,wk,wv,wo,w1,w2,w3,lm_head,all,none
-    //                      default: w2
-    //   KUIPER_SQ4_DEQUANT_LAST_N: only dequantize last N layers for per-layer matrices
-    //                             default: 1 (keeps VRAM increase bounded)
+    // 读取环境变量
     const char* env_cstr = std::getenv("KUIPER_SQ4_DEQUANT");
     std::string env = env_cstr ? std::string(env_cstr) : std::string("w2");
 
@@ -391,7 +385,7 @@ void LLama2Model::create_param_quant_layers() {
 
     const int32_t dim = config_->dim_;
     const int32_t hidden_dim = config_->hidden_dim_;
-
+    // 读取一个SQ4量化块，并根据反量化策略返回对应的计算层
     auto read_sq4_matmul = [&](const char* tag, int32_t layer_idx, int32_t rows,
                                int32_t cols) -> std::shared_ptr<op::Layer> {
       model::QuantBlockPayload payload;
@@ -503,7 +497,7 @@ void LLama2Model::create_param_quant_layers() {
       llama_layers_->cls_layer_ = read_sq4_matmul("lm_head", -1, config_->vocab_size_, dim);
     }
 
-    // ---- Step 7: 常数区（embedding + norms）对齐/边界/校验 ----
+    // ---- 常数区（embedding + norms）对齐/边界/校验 ----
     // 接下来应当是 fp32 embedding + rmsnorm
     const size_t off = cursor.offset_bytes_from(begin);
     const size_t align = 16;  // 对应 exporter: _write_align_padding(f, 16)

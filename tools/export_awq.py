@@ -6,43 +6,7 @@ from awq import AutoAWQForCausalLM
 from transformers import AutoTokenizer
 
 
-"""\
-KuiperLLama AWQ4 导出说明（仅导出；C++ 端需要配套实现 AWQ4 MatMul 读取/计算）：
 
-目标：尽可能贴合 KuiperLLama 现有量化 `.bin` 的加载流程：
-  - C++ 端 `Model::read_model_file()` 会先读 `ModelConfig`（7 个 int32），
-    然后在 `is_quant_model_==true` 时再读一个 int32 `group_size_`。
-  - 随后使用 mmap，并把 `weight_data` 指向 (header + group_size) 后的权重区域。
-
-因此，本脚本写出的二进制布局为：
-
-  [ModelConfig(7*i32)]
-  [group_size(i32)]
-  ======= weights region (byte stream) =======
-  1) 所有层的 WQ (按 layer 0..L-1)
-  2) 所有层的 WK
-  3) 所有层的 WV
-  4) 所有层的 WO
-  5) 所有层的 W1 (gate_proj)
-  6) 所有层的 W2 (down_proj)
-  7) 所有层的 W3 (up_proj)
-  8) WCLS / lm_head
-  9) Embedding (fp32)
- 10) Attention RMSNorm per-layer (fp32)
- 11) FFN RMSNorm per-layer (fp32)
- 12) Final RMSNorm (fp32)
-
-其中每个 AWQ 线性层按顺序写入 3 个张量：
-  - qweight: torch.int32 (AutoAWQ GEMM packed format)
-  - scales : 写成 torch.float32（为了后续 C++ 端实现更省心；也更贴合现有 int8 scale 读取方式）
-  - qzeros : torch.int32
-
-注意：
-  - 这里不尝试把 qweight 解包成 int8（避免误解 AutoAWQ 的 packing 细节）。
-    C++ 端应实现与 AutoAWQ(GEMM) 对齐的解包/矩阵乘。
-  - 为了避开 KuiperLLama 现有 `create_param_quant_layers()` 在 shared-weight 分支的
-    pos/weight_ptr 重叠问题，这里强制把 vocab_size 写成负数（等价于“非共享 head”标志）。
-"""
 
 
 def _write_tensor_raw(f, tensor: torch.Tensor) -> None:

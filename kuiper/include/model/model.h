@@ -27,8 +27,8 @@ class Model {
   enum class QuantFormat : uint8_t {
     kNone = 0,
     kInt8Q8 = 1,
-    kAwq4 = 2,  // 预留/历史
-    kSQ4 = 3,   // SmoothQuant + RTN 4bit（对应你的 export_smooth_rtn_pro_v3.py）
+    kAwq4 = 2,  // 预留。姑且先留着吧
+    kSQ4 = 3,   // SmoothQuant + RTN 4bit（export_smooth_rtn_pro_v3.py）
   };
 
   QuantFormat quant_format() const { return quant_format_; }

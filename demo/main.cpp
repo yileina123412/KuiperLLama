@@ -138,37 +138,33 @@ int main(int argc, char* argv[]) {
   // const char* checkpoint_path = argv[1];  // e.g. out/model.bin
   // const char* tokenizer_path = argv[2];
   // const char* checkpoint_path =
-  //     "/home/furina/code_learnning/cpp/cuda/KuiperLLama/models/stories110M.bin";  // e.g.
-  // const char* checkpoint_path =
-  //     "/home/furina/code_learnning/cpp/cuda/KuiperLLama/models/tinyllama_int8.bin";  // e.g.
-  const char* checkpoint_path =
-      "/home/furina/code_learnning/cpp/cuda/KuiperLLama/models/llama2_7b_smooth_pro_v3.bin";  //
-  //     e.g.
+  //     "/home/furina/models/stories110M.bin";  // e.g.
+  const char* checkpoint_path = "/home/furina/models/tinyllama_int8.bin";  // e.g.
+  // const char* checkpoint_path = "/home/furina/models/llama2_7b_smooth_pro_v3.bin";
+  // const char* checkpoint_path = "/home/furina/models/tinyllama_4bit.bin";
 
-  const char* tokenizer_path =
-      "/home/furina/code_learnning/cpp/cuda/KuiperLLama/models/tokenizer.model";
+  const char* tokenizer_path = "/home/furina/models/tokenizer.model";
   // const char* checkpoint_path =
-  //     "/home/furina/code_learnning/cpp/cuda/KuiperLLama/models/llama32_1bnq.bin";  // e.g.
+  //     "/home/furina/models/llama32_1bnq.bin";  // e.g.
   //                                                                                  //
   //                                                                                  out/model.bin
   // const char* tokenizer_path =
-  //     "/home/furina/code_learnning/cpp/cuda/KuiperLLama/models/tokenizer.json";
-
-  model::LLama2Model model(base::TokenizerType::kEncodeSpe, tokenizer_path, checkpoint_path, true,
-                           model::Model::QuantFormat::kSQ4);
+  //     "/home/furina/models/tokenizer.json";
   // model::LLama2Model model(base::TokenizerType::kEncodeSpe, tokenizer_path, checkpoint_path,
-  // true); auto init_status = model.init(base::DeviceType::kDeviceCPU);
+  // true,
+  //                          model::Model::QuantFormat::kSQ4);
+  model::LLama2Model model(base::TokenizerType::kEncodeSpe, tokenizer_path, checkpoint_path, true);
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
   if (!init_status) {
     LOG(FATAL) << "The model init failed, the error code is: " << init_status.get_err_code();
   }
-  const std::string& sentence = "this";
+  const std::string& sentence = "hello";
   // const std::string& sentence = "this is a test,please answer me in English.";
 
   auto start = std::chrono::steady_clock::now();
   printf("Generating...\n");
   fflush(stdout);
-  int steps = generate(model, sentence, 256, true);
+  int steps = generate(model, sentence, 128, true);
   auto end = std::chrono::steady_clock::now();
   auto duration = std::chrono::duration<double>(end - start).count();
   printf("\nsteps/s:%lf\n", static_cast<double>(steps) / duration);

@@ -6,7 +6,10 @@ import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from functools import partial
 
+# 核心目标：将 FP16 模型量化为 4-bit 权重，通过 SmoothQuant 降低量化误差，最终输出可被 C++ 直接读取的二进制文件。
+
 """
+实现了SmoothQuant + RTN的4bit量化
 KuiperLLama SmoothQuant + RTN Pro (V3 - Segmented Layout)
 1. 激活值观察：捕捉每层输入的 max(abs(X))。
 2. 等效折叠：将 1/s 乘入 RMSNorm，将 s 乘入 Weight（数学等价）。
@@ -14,12 +17,14 @@ KuiperLLama SmoothQuant + RTN Pro (V3 - Segmented Layout)
 4. 分段导出：按权重类型（WQ, WK...）分块写出，贴合 C++ 现有加载结构。
 """
 
-BLOCK_TYPE_SQ4 = 1  # 代表通用 Naive 4-bit (含 SmoothQuant 预处理)
-
+BLOCK_TYPE_SQ4 = 1  
+# 按指定对齐数（16B）填充空字节，保证二进制文件地址对齐（提升 C++ 读取效率） 让数据地址是16的整数倍，方便C++端使用SIMD指令批量加载和处理数据
+# 保证：下一段要写入的数据，起始地址一定是 16 的整数倍！
 def _write_align_padding(f, align: int = 16):
     """Pad file with zeros so that f.tell() becomes a multiple of `align`."""
     assert align in (4, 8, 16, 32, 64)
-    cur = f.tell()
+    # 计算文件指针位置和需要填充的字节数
+    cur = f.tell() # 获取当前文件指针位置
     pad = (-cur) % align
     if pad:
         f.write(b"\x00" * pad)
@@ -33,21 +38,22 @@ def _write_block_descriptor(f, b_type, rows, cols, q_size, s_size, z_size, group
     f.write(desc)
 
 # --- 激活值捕获 ---
-act_scales = {}
+act_scales = {} # 字典，存储每个Linear层输入激活值的绝对值最大值
+# 前向钩子函数：捕获每个 Linear 层输入激活值的绝对值最大值（用于 SmoothQuant 计算缩放因子）
 def get_act_scales(name, module, input, output):
-    inp = input[0].detach().float().abs()
-    scales = inp.max(dim=0)[0].max(dim=0)[0] 
+    inp = input[0].detach().float().abs()  # # 40: 取输入张量→脱离计算图→转float→取绝对值（避免梯度干扰，统一精度）
+    scales = inp.max(dim=0)[0].max(dim=0)[0]  # 41: 计算激活值的绝对值最大值（降维取max，适配LLM的输入形状）
     if name not in act_scales:
         act_scales[name] = scales
     else:
         act_scales[name] = torch.max(act_scales[name], scales)
-
+# 核心量化函数：实现分组 RTN 4-bit 量化，输出量化后权重（uint8）、缩放因子（scales）、零点（zeros）
 def quantize_rtn_naive(tensor, group_size=128):
     """顺序 RTN 量化，产生 100% 物理顺序的数据"""
     rows, cols = tensor.shape
     tensor = tensor.to(torch.float32)
     reshaped_w = tensor.view(rows, -1, group_size)
-    min_val = reshaped_w.min(dim=-1, keepdim=True)[0]
+    min_val = reshaped_w.min(dim=-1, keepdim=True)[0] # 每组最小值
     max_val = reshaped_w.max(dim=-1, keepdim=True)[0]
     
     scales = (max_val - min_val) / 15.0
@@ -59,8 +65,9 @@ def quantize_rtn_naive(tensor, group_size=128):
     q_weight = torch.clamp(q_weight, 0, 15).to(torch.uint8)
     
     return q_weight.view(rows, cols), scales.view(rows, -1), zeros.view(rows, -1).to(torch.uint8)
-
+# 装饰器，作用是让被装饰函数内的所有张量运算不构建计算图、不追踪梯度（等价于在函数体外包一层 with torch.no_grad():）。
 @torch.no_grad()
+# 执行smoothquant折叠：根据捕获的激活值计算缩放因子 s，将其应用于权重和 RMSNorm，实现数学等价的平滑量化准备
 def apply_smooth_quant(model, alpha=0.5):
     """执行 SmoothQuant 折叠，将 1/s 吸收进 RMSNorm"""
     layers = model.model.layers
@@ -104,6 +111,7 @@ def apply_smooth_quant(model, alpha=0.5):
         layer.post_attention_layernorm.weight.div_(s_mlp)
 
 def main():
+    # 解析命令行参数
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--output_bin", required=True)
@@ -122,30 +130,21 @@ def main():
     
     args = parser.parse_args()
 
-    # 1. 加载
-    print("🚀 正在加载 FP16 模型...")
+    # 1. 加载模型和配套的tokenizer，准备进行量化和导出
+    print(" 正在加载 FP16 模型...")
     model = AutoModelForCausalLM.from_pretrained(args.model_path, torch_dtype=torch.float16, device_map="cpu")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     
-    # 2. 收集激活值
+    # 2. 收集激活值 给所有linear层注册前向钩子，捕获输入激活值的绝对值最大值，为 SmoothQuant 计算缩放因子做准备
     hooks = []
     for name, m in model.named_modules():
+        # 仅对 Linear 层注册钩子，捕获其输入激活值的绝对值最大值（用于后续 SmoothQuant 计算缩放因子）
         if isinstance(m, nn.Linear):
             hooks.append(m.register_forward_hook(partial(get_act_scales, name)))
     
-    # print("📊 运行高精度校准集...")
-    # calib_texts = [
-    #     "The Llama architecture uses RMSNorm and rotary positional embeddings.",
-    #     "SmoothQuant migrates quantization difficulty from activations to weights.",
-    #     "Quantizing a model to 4-bit significantly reduces VRAM usage.",
-    #     "The RTX 5060 is capable of high-speed inference with quantized models."
-    # ] * 20
-    # with torch.no_grad():
-    #     for text in calib_texts:
-    #         model(**tokenizer(text, return_tensors="pt"))
-    # for h in hooks: h.remove()
 
-    print("📊 运行校准集...")
+
+    print(" 运行校准集...")
 
     calib_texts = []
     if args.calib_path:
@@ -173,17 +172,17 @@ def main():
             model(**tokenizer(text, return_tensors="pt"))
 
     # 3. 平滑折叠
-    # print("✨ 执行数学等效折叠 (SmoothQuant)...")
+    # print(" 执行数学等效折叠 (SmoothQuant)...")
     # apply_smooth_quant(model)
 
     if args.no_smoothquant:
-        print("⚠️ 关闭 SmoothQuant：只做 RTN4（用于对照实验）")
+        print(" 关闭 SmoothQuant：只做 RTN4（用于对照实验）")
     else:
-        print(f"✨ 执行数学等效折叠 (SmoothQuant), alpha={args.alpha} ...")
+        print(f" 执行数学等效折叠 (SmoothQuant), alpha={args.alpha} ...")
         apply_smooth_quant(model, alpha=args.alpha)
 
     # 4. 分段导出
-    print(f"📦 正在导出分段排布权重至 {args.output_bin}...")
+    print(f" 正在导出分段排布权重至 {args.output_bin}...")
     with open(args.output_bin, "wb") as f:
         cfg = model.config
         layers = model.model.layers
@@ -204,7 +203,7 @@ def main():
             s_exp = scales.repeat_interleave(args.group_size, dim=1)[:, :q_int.shape[1]]
             W_dequant = (q_int.float() - z_exp) * s_exp
             err = (module.weight.data.float() - W_dequant).abs().max().item()
-            print(f"  ✅ {name:15} | 误差: {err:.6f}")
+            print(f"  {name:15} | 误差: {err:.6f}")
 
             # 数据打包
             q_flat = q_int.flatten().numpy()
@@ -240,8 +239,8 @@ def main():
         # C. 导出 lm_head
         export_layer_module(model.lm_head, "lm_head")
 
-        # --- 【关键点】在此插入对齐填充 ---
-        print("💾 正在插入对齐填充...")
+        # --- 在此插入对齐填充 ---
+        print(" 正在插入对齐填充...")
         _write_align_padding(f, align=16)
 
         # D. 导出 Embedding 和 Norms (保持 FP32)
@@ -252,7 +251,7 @@ def main():
         for l in layers: _write_tensor(l.post_attention_layernorm.weight)
         _write_tensor(model.model.norm.weight)
 
-    print(f"\n✨ [V3 成功] 文件已生成！此文件可直接被 C++ 循环分段读取。")
+    print(f"\n [V3 成功] 文件已生成！")
 
 if __name__ == "__main__":
     main()

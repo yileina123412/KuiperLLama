@@ -4,25 +4,25 @@
 #include <string>
 #include "base/base.h"
 #include "model/quant_block.h"
-
+// 定义读取导出的二进制文件的接口
 namespace model {
 
-// 对齐 export_smooth_rtn_pro_v3.py：BLOCK_TYPE_SQ4 = 1
+// export_smooth_rtn_pro_v3.py：BLOCK_TYPE_SQ4 = 1 目前由于只有一种，用处姑且不大
 static constexpr int32_t kBlockTypeSQ4 = 1;
-
+// 一个完整的module
 struct QuantBlockPayload {
   QuantBlockDesc desc{};
-  const uint8_t* q = nullptr;  // packed nibble weights
-  const uint8_t* s = nullptr;  // fp32 scales bytes
+  const uint8_t* q = nullptr;  //
+  const uint8_t* s = nullptr;  // fp32 scales
   const uint8_t* z = nullptr;  // packed nibble zeros
   size_t total_bytes = 0;      // desc(32) + q + s + z
 };
 
-// SQ4 假设：按“每行沿 cols 方向分组”
 // group_count = rows * ceil(cols / group_size)
 // scales: float32 per group
-// zeros: 4bit per group (packed two per byte)
+// zeros: 4bit per group 2
 // q: 4bit per weight (packed two per byte)
+
 inline size_t SQ4GroupsPerRow(int32_t cols, int32_t group_size) {
   return (static_cast<size_t>(cols) + static_cast<size_t>(group_size) - 1) /
          static_cast<size_t>(group_size);
@@ -36,14 +36,15 @@ inline size_t SQ4ExpectedQBytes(int32_t rows, int32_t cols) {
   const size_t n = static_cast<size_t>(rows) * static_cast<size_t>(cols);
   return (n + 1) / 2;  // 2 weights per byte
 }
-
+// 计算scale的数量
 inline size_t SQ4ExpectedSBytes(int32_t rows, int32_t cols, int32_t group_size) {
   return SQ4GroupCount(rows, cols, group_size) * sizeof(float);
 }
 
 inline size_t SQ4ExpectedZBytes(int32_t rows, int32_t cols, int32_t group_size) {
   const size_t g = SQ4GroupCount(rows, cols, group_size);
-  return (g + 1) / 2;  // 2 zeros per byte
+  // return g / 2;
+  return (g + 1) / 2;
 }
 
 inline base::Status ValidateBasicDesc(const QuantBlockDesc& d) {
@@ -82,7 +83,7 @@ inline base::Status ValidateSQ4Desc(const QuantBlockDesc& d, int32_t expected_ro
     return base::error::ModelParseError("QuantBlock: group_size mismatch");
   }
 
-  // scales 是 fp32 bytes，至少保证 4 字节对齐长度（不要求地址对齐）
+  // scales 是 fp32 bytes，至少保证 4 字节对齐长度
   if ((d.s_size % static_cast<int32_t>(sizeof(float))) != 0) {
     return base::error::ModelParseError("QuantBlock: s_size not multiple of 4");
   }
@@ -130,7 +131,7 @@ class QuantBlockCursor {
     *out_desc = ReadQuantBlockDesc(cur_);
     return base::error::Success();
   }
-
+  // 读取块数据
   base::Status ReadNext(QuantBlockPayload* out, bool basic_validate = true) {
     if (!out) return base::error::InvalidArgument("ReadNext: out is null");
     if (remaining_bytes() < sizeof(QuantBlockDesc)) {
