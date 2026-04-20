@@ -47,8 +47,6 @@ class Model {
   // prefill阶段和decode阶段
   virtual base::Status prefill(const tensor::Tensor& input, const tensor::Tensor& pos_tensor,
                                int& next) const = 0;
-  virtual base::Status decode_o(const tensor::Tensor& input, const tensor::Tensor& pos_tensor,
-                                int& next) const = 0;
 
   base::ModelType model_type() const;
 

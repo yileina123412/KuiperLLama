@@ -93,34 +93,18 @@ base::Status MatmulLayer::set_bias(int32_t idx, int32_t& dim, const void* bias_p
   CHECK_LT(idx, bias_.size());
   CHECK_NE(bias_ptr, nullptr);
 
-  size_t size = dim * sizeof(float);
+  size_t size = static_cast<size_t>(dim) * sizeof(float);
   std::shared_ptr<base::Buffer> buffer =
       std::make_shared<base::Buffer>(size, nullptr, const_cast<void*>(bias_ptr), true);
   if (device_type != base::DeviceType::kDeviceUnknown) {
     buffer->set_device_type(device_type);
   }
 
-  if (!is_quant_layer_) {
-    tensor::Tensor bias(base::DataType::kDataTypeFp32, dim);
-    bias.set_device_type(device_type);
-    CHECK(bias.assign(buffer));
-    // LOG(INFO) << "bias:" << bias.index<float>(0);
-    bias_.at(idx) = bias;
-  } else {
-    // is quant layer
-    tensor::Tensor bias(base::DataType::kDataTypeInt8, dim);
-    bias.set_device_type(device_type);
-    CHECK(bias.assign(buffer));
-    bias_.at(idx) = bias;
-
-    const int32_t bias_size = static_cast<int32_t>(bias.size());
-    CHECK(bias_size % group_size_ == 0);
-
-    int32_t scale_nums = bias_size / group_size_;
-    scales_ = tensor::Tensor{base::DataType::kDataTypeFp32, scale_nums, false, nullptr,
-                             reinterpret_cast<float*>((int8_t*)bias_ptr + bias_size)};
-    scales_.set_device_type(device_type);
-  }
+  // 无论量化与否，bias 一律按 fp32 处理
+  tensor::Tensor bias(base::DataType::kDataTypeFp32, dim);
+  bias.set_device_type(device_type);
+  CHECK(bias.assign(buffer));
+  bias_.at(idx) = bias;
 
   return base::error::Success();
 }

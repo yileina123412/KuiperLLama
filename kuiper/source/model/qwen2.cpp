@@ -10,7 +10,16 @@
 #include "../op/kernels/cuda/rope_kernel.cuh"
 #include "base/tick.h"
 namespace model {
-
+static tensor::Tensor row_view_fp32(const tensor::Tensor& mat2d, int32_t row, int32_t dim,
+                                    base::DeviceType device_type) {
+  float* base_ptr = const_cast<float*>(mat2d.ptr<float>(static_cast<int64_t>(row) * dim));
+  auto buf = std::make_shared<base::Buffer>(static_cast<size_t>(dim) * sizeof(float), nullptr,
+                                            base_ptr, true);
+  tensor::Tensor v(base::DataType::kDataTypeFp32, dim);
+  CHECK(v.assign(buf));
+  v.set_device_type(device_type);
+  return v;
+}
 void Qwen2Layers::to_cuda(std::shared_ptr<kernel::CudaConfig> config) {
   if (add_layer_) {
     add_layer_->set_cuda_config(config);
@@ -128,6 +137,47 @@ base::Status Qwen2Model::init(base::DeviceType device_type) {
   if (!read_status) {
     return read_status;
   }
+  // // 粗校验：当前 Qwen2 解析按 FP32 legacy layout
+  // // 若文件明显偏小（常见是 FP16 权重），直接报错避免后续 cudaMemcpy 段错误
+  // {
+  //   const int64_t dim = config_->dim_;
+  //   const int64_t hidden = config_->hidden_dim_;
+  //   const int64_t nl = config_->layer_num_;
+  //   const int64_t v = std::abs(config_->vocab_size_);
+  //   const int64_t kv_dim = config_->kv_dim_;
+  //   const int64_t head = config_->head_size_;
+  //   const int64_t seq = config_->seq_len_;
+
+  //   // 与 create_param_layers 一致的 legacy fp32 布局（含 q/k/v bias）
+  //   int64_t floats = 0;
+  //   floats += v * dim;                       // embedding
+  //   floats += nl * dim;                      // attn rmsnorm
+  //   floats += nl * (dim * dim + dim);        // wq + b
+  //   floats += nl * (kv_dim * dim + kv_dim);  // wk + b
+  //   floats += nl * (kv_dim * dim + kv_dim);  // wv + b
+  //   floats += nl * (dim * dim);              // wo
+  //   floats += nl * dim;                      // ffn rmsnorm
+  //   floats += nl * hidden * dim;             // w1
+  //   floats += nl * dim * hidden;             // w2
+  //   floats += nl * hidden * dim;             // w3
+  //   floats += dim;                           // final rmsnorm
+  //   floats += seq * head;                    // freqs_cos
+  //   floats += seq * head;                    // freqs_sin
+  //   if (!config_->is_shared_weight_) {
+  //     floats += v * dim;  // cls
+  //   }
+
+  //   const int64_t expect_bytes = 7LL * sizeof(int32_t) + floats * sizeof(float);
+  //   const int64_t real_bytes = static_cast<int64_t>(raw_model_data_->file_size);
+
+  //   // 小于 90% 基本可判定格式不对（常见是 fp16 半大小）
+  //   if (real_bytes < expect_bytes * 9 / 10) {
+  //     return base::error::ModelParseError(
+  //         "Qwen2 model file size mismatch: likely not legacy FP32 .bin "
+  //         "(maybe FP16 or different export format).");
+  //   }
+  // }
+
   init_mem();
   if (device_type_ == base::DeviceType::kDeviceCPU) {
     kernel::sin_cos_cache_calc_cpu(config_->head_size_, config_->seq_len_,
@@ -166,6 +216,102 @@ base::Status Qwen2Model::forward(const tensor::Tensor& input, const tensor::Tens
   return base::error::Success();
 }
 
+base::Status Qwen2Model::prefill(const tensor::Tensor& input, const tensor::Tensor& pos_tensor,
+                                 int& next) const {
+  if (input.is_empty()) {
+    return base::error::InvalidArgument("The input tensor is empty.");
+  }
+  if (device_type_ == base::DeviceType::kDeviceCPU && is_quant_model_) {
+    return base::error::InternalError("Unsupported int8 quant in the cpu device");
+  }
+
+  for (int32_t layer_idx = 0; layer_idx < config_->layer_num_; ++layer_idx) {
+    if (input.dims_size() == 1) {
+      attention_rms(layer_idx, input);
+      attention_qkv(layer_idx, pos_tensor);
+      attention_mha(layer_idx, pos_tensor);
+      feed_forward(layer_idx, input);
+    } else {
+      const int32_t token_num = input.get_dim(0);
+
+      tensor::Tensor rms2d = get_buffer(ModelBufferType::kOutputRMSNorm2D);
+      rms2d.reshape({token_num, config_->dim_});
+
+      tensor::Tensor query2d = get_buffer(ModelBufferType::kQuery2D);
+      query2d.reshape({token_num, config_->dim_});
+
+      tensor::Tensor mha2d = get_buffer(ModelBufferType::kOutputMHA2D);
+      mha2d.reshape({token_num, config_->dim_});
+
+      tensor::Tensor attn2d = get_buffer(ModelBufferType::kAttnOutput2D);
+      attn2d.reshape({token_num, config_->dim_});
+
+      auto rmsnorm_layer = qwen_layers_->rmsnorm_layers_.at(layer_idx);
+      CHECK_NE(rmsnorm_layer, nullptr);
+      STATUS_CHECK(rmsnorm_layer->forward(input, rms2d));
+
+      attention_qkv_block(layer_idx, pos_tensor, rms2d, query2d);
+
+      auto mha_layer = qwen_layers_->mha_layer_;
+      CHECK_NE(mha_layer, nullptr);
+      const int32_t start_pos = pos_tensor.index<int32_t>(0);
+      std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer)->set_pos(start_pos);
+      std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer)->set_layer_idx(layer_idx);
+
+      tensor::Tensor score_storage = get_buffer(ModelBufferType::kScoreStorage);
+      tensor::Tensor key_cache = get_buffer(ModelBufferType::kKeyCache);
+      tensor::Tensor val_cache = get_buffer(ModelBufferType::kValueCache);
+      STATUS_CHECK(mha_layer->forward(query2d, score_storage, key_cache, val_cache, mha2d));
+
+      const auto& wo_layer = qwen_layers_->wo_layers_.at(layer_idx);
+      CHECK_NE(wo_layer, nullptr);
+      STATUS_CHECK(wo_layer->forward(mha2d, attn2d));
+
+      CHECK_NE(qwen_layers_->add_layer_, nullptr);
+      STATUS_CHECK(qwen_layers_->add_layer_->forward(input, attn2d, input));
+
+      tensor::Tensor ffn_norm2d = get_buffer(ModelBufferType::kFFNRMSNorm2D);
+      ffn_norm2d.reshape({token_num, config_->dim_});
+      const auto& ffn_rms = qwen_layers_->rmsnorm_layers_.at(layer_idx + config_->layer_num_);
+      CHECK_NE(ffn_rms, nullptr);
+      STATUS_CHECK(ffn_rms->forward(input, ffn_norm2d));
+
+      tensor::Tensor w1_out2d = get_buffer(ModelBufferType::kW1Output2D);
+      tensor::Tensor w3_out2d = get_buffer(ModelBufferType::kW3Output2D);
+      w1_out2d.reshape({token_num, config_->hidden_dim_});
+      w3_out2d.reshape({token_num, config_->hidden_dim_});
+
+      const auto& w1 = qwen_layers_->w1_layers_.at(layer_idx);
+      const auto& w3 = qwen_layers_->w3_layers_.at(layer_idx);
+      CHECK_NE(w1, nullptr);
+      CHECK_NE(w3, nullptr);
+      STATUS_CHECK(w1->forward(ffn_norm2d, w1_out2d));
+      STATUS_CHECK(w3->forward(ffn_norm2d, w3_out2d));
+
+      CHECK_NE(qwen_layers_->swiglu_layer_, nullptr);
+      STATUS_CHECK(qwen_layers_->swiglu_layer_->forward(w1_out2d, w3_out2d, w1_out2d));
+
+      tensor::Tensor w2_out2d = get_buffer(ModelBufferType::kW2Output2D);
+      w2_out2d.reshape({token_num, config_->dim_});
+      const auto& w2 = qwen_layers_->w2_layers_.at(layer_idx);
+      CHECK_NE(w2, nullptr);
+      STATUS_CHECK(w2->forward(w1_out2d, w2_out2d));
+
+      STATUS_CHECK(qwen_layers_->add_layer_->forward(input, w2_out2d, input));
+    }
+  }
+
+  if (input.dims_size() == 2) {
+    const int32_t token_num = input.get_dim(0);
+    tensor::Tensor last = row_view_fp32(input, token_num - 1, config_->dim_, device_type_);
+    cls_logits(last);
+  } else {
+    cls_logits(input);
+  }
+
+  return base::error::Success();
+}
+
 void Qwen2Model::create_nonparam_layers() {
   CHECK(qwen_layers_ != nullptr);
   qwen_layers_->rope_layer_ = std::make_shared<op::RoPELayer>(
@@ -185,35 +331,210 @@ void Qwen2Model::create_param_quant_layers() {
   CHECK(is_quant_model_);
   CHECK(qwen_layers_ != nullptr);
 
+  if (quant_format() == QuantFormat::kSQ4) {
+    auto cpu_device_type = base::DeviceType::kDeviceCPU;
+
+    const uint8_t* begin = reinterpret_cast<const uint8_t*>(raw_model_data_->weight_data);
+    const uint8_t* end =
+        reinterpret_cast<const uint8_t*>(raw_model_data_->data) + raw_model_data_->file_size;
+
+    model::QuantBlockCursor cursor(begin, end);
+
+    const int32_t dim = config_->dim_;
+    const int32_t hidden_dim = config_->hidden_dim_;
+    // 读取一个SQ4量化块，并根据反量化策略返回对应的计算层
+    // 读取一个SQ4量化块，始终按SQ4权重层构建（不做提前反量化）
+    auto read_sq4_matmul = [&](const char* tag, int32_t layer_idx, int32_t rows,
+                               int32_t cols) -> std::shared_ptr<op::Layer> {
+      (void)tag;
+      (void)layer_idx;
+
+      model::QuantBlockPayload payload;
+      STATUS_CHECK(cursor.ReadNextSQ4(rows, cols, group_size_, &payload, true));
+
+      op::SQ4WeightView view;
+      view.rows = payload.desc.rows;
+      view.cols = payload.desc.cols;
+      view.group_size = payload.desc.group_size;
+
+      view.qweight_packed = payload.q;
+      view.q_bytes = static_cast<size_t>(payload.desc.q_size);
+
+      view.scales = payload.s;
+      view.s_bytes = static_cast<size_t>(payload.desc.s_size);
+
+      view.zeros_packed = payload.z;
+      view.z_bytes = static_cast<size_t>(payload.desc.z_size);
+
+      auto layer = std::make_shared<op::MatmulSQ4Layer>(device_type_, rows, cols);
+      STATUS_CHECK(layer->set_sq4_weight(view, cpu_device_type, true));
+      return layer;
+    };
+
+    // WQ
+    for (int32_t i = 0; i < config_->layer_num_; ++i) {
+      qwen_layers_->wq_layers_.push_back(read_sq4_matmul("wq", i, dim, dim));
+    }
+    // WK
+    for (int32_t i = 0; i < config_->layer_num_; ++i) {
+      qwen_layers_->wk_layers_.push_back(read_sq4_matmul("wk", i, config_->kv_dim_, dim));
+    }
+    // WV
+    for (int32_t i = 0; i < config_->layer_num_; ++i) {
+      qwen_layers_->wv_layers_.push_back(read_sq4_matmul("wv", i, config_->kv_dim_, dim));
+    }
+    // WO
+    for (int32_t i = 0; i < config_->layer_num_; ++i) {
+      qwen_layers_->wo_layers_.push_back(read_sq4_matmul("wo", i, dim, dim));
+    }
+    // W1
+    for (int32_t i = 0; i < config_->layer_num_; ++i) {
+      qwen_layers_->w1_layers_.push_back(read_sq4_matmul("w1", i, hidden_dim, dim));
+    }
+    // W2
+    for (int32_t i = 0; i < config_->layer_num_; ++i) {
+      qwen_layers_->w2_layers_.push_back(read_sq4_matmul("w2", i, dim, hidden_dim));
+    }
+    // W3
+    for (int32_t i = 0; i < config_->layer_num_; ++i) {
+      qwen_layers_->w3_layers_.push_back(read_sq4_matmul("w3", i, hidden_dim, dim));
+    }
+
+    // lm_head / cls
+    // llama_layers_->cls_layer_ = read_sq4_matmul(config_->vocab_size_, dim);
+    if (config_->is_shared_weight_) {
+      size_t skipped = 0;
+      STATUS_CHECK(cursor.SkipNext(&skipped));  // 仍然消费掉 exporter 写入的 lm_head SQ4 block
+      LOG(INFO) << "SQ4: skipped lm_head SQ4 block bytes=" << skipped
+                << " (use fp32 tied embedding for cls)";
+      // cls_layer_ 会在 embedding weight_ptr 就绪后再绑定
+    } else {
+      qwen_layers_->cls_layer_ = read_sq4_matmul("lm_head", -1, config_->vocab_size_, dim);
+    }
+
+    // ---- 常数区（embedding + norms）对齐/边界/校验 ----
+    // 接下来应当是 fp32 embedding + rmsnorm
+    const size_t off = cursor.offset_bytes_from(begin);
+    const size_t align = 16;  // 对应 exporter: _write_align_padding(f, 16)
+    const size_t pad = (align - (off % align)) % align;
+
+    const size_t emb_floats =
+        static_cast<size_t>(std::abs(config_->vocab_size_)) * static_cast<size_t>(dim);
+    const size_t norm_floats =
+        static_cast<size_t>(2 * config_->layer_num_ + 1) * static_cast<size_t>(dim);
+    const size_t const_bytes = (emb_floats + norm_floats) * sizeof(float);
+
+    CHECK(cursor.remaining_bytes() >= pad + const_bytes)
+        << "SQ4: not enough bytes for fp32 constants region";
+
+    // 可选但推荐：验证 padding 全为 0（更容易定位导出/读取顺序错误）
+    const uint8_t* p0 = cursor.ptr();
+    for (size_t i = 0; i < pad; ++i) {
+      CHECK_EQ(p0[i], 0) << "SQ4: non-zero padding byte, bin may be corrupted";
+    }
+
+    float* weight_ptr = reinterpret_cast<float*>(const_cast<uint8_t*>(cursor.ptr() + pad));
+    CHECK_EQ(reinterpret_cast<uintptr_t>(weight_ptr) % alignof(float), 0)
+        << "SQ4: fp32 constants not aligned to float";
+
+    // embedding
+    qwen_layers_->embedding_layer_ = std::make_shared<op::EmbeddingLayer>(
+        device_type_, config_->dim_, config_->seq_len_, std::abs(config_->vocab_size_));
+    qwen_layers_->embedding_layer_->set_weight(0, {std::abs(config_->vocab_size_), dim}, weight_ptr,
+                                               cpu_device_type);
+
+    if (config_->is_shared_weight_) {
+      auto cls = std::make_shared<op::MatmulLayer>(device_type_, config_->vocab_size_, dim, false);
+      cls->set_weight(0, {config_->vocab_size_, dim}, weight_ptr, cpu_device_type);
+      qwen_layers_->cls_layer_ = cls;
+    }
+
+    weight_ptr += static_cast<size_t>(config_->vocab_size_) * static_cast<size_t>(dim);
+
+    // rmsnorm attention/ffn/final: 2*layer_num + 1
+    for (int32_t i = 0; i < 2 * config_->layer_num_ + 1; ++i) {
+      auto rms_norm_layer = std::make_shared<op::RmsNormLayer>(device_type_, dim);
+      rms_norm_layer->set_weight(0, {dim}, weight_ptr, cpu_device_type);
+      qwen_layers_->rmsnorm_layers_.push_back(rms_norm_layer);
+      weight_ptr += dim;
+    }
+    CHECK(weight_ptr <= reinterpret_cast<float*>(const_cast<uint8_t*>(end)))
+        << "SQ4: constants region overflow";
+
+    return;
+  }
+
   size_t pos = 0;
   int32_t dim = config_->dim_;
   auto cpu_device_type = base::DeviceType::kDeviceCPU;
 
+  // // query
+  // for (int32_t i = 0; i < config_->layer_num_; ++i) {
+  //   auto wq = std::make_shared<op::MatmulLayer>(device_type_, dim, dim, true);
+  //   wq->set_group_size(group_size_);
+  //   wq->set_weight(0, {dim, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+  //   qwen_layers_->wq_layers_.push_back(wq);
+  //   pos = pos + dim * dim + wq->get_scale_num() * sizeof(float);
+  // }
+
+  // // key
+  // for (int32_t i = 0; i < config_->layer_num_; ++i) {
+  //   auto wk = std::make_shared<op::MatmulLayer>(device_type_, config_->kv_dim_, dim, true);
+  //   wk->set_group_size(group_size_);
+  //   wk->set_weight(0, {config_->kv_dim_, dim}, this->raw_model_data_->weight(pos),
+  //   cpu_device_type); qwen_layers_->wk_layers_.push_back(wk); pos = pos + config_->kv_dim_ * dim
+  //   + wk->get_scale_num() * sizeof(float);
+  // }
+
+  // // value
+  // for (int32_t i = 0; i < config_->layer_num_; ++i) {
+  //   auto wv = std::make_shared<op::MatmulLayer>(device_type_, config_->kv_dim_, dim, true);
+  //   wv->set_group_size(group_size_);
+  //   wv->set_weight(0, {config_->kv_dim_, dim}, this->raw_model_data_->weight(pos),
+  //   cpu_device_type); qwen_layers_->wv_layers_.push_back(wv); pos += config_->kv_dim_ * dim +
+  //   wv->get_scale_num() * sizeof(float);
+  // }
+
   // query
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wq = std::make_shared<op::MatmulLayer>(device_type_, dim, dim, true);
+    auto wq = std::make_shared<op::MatmulLayer>(device_type_, dim, dim, true, true);
     wq->set_group_size(group_size_);
     wq->set_weight(0, {dim, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    pos = pos + static_cast<size_t>(dim) * dim + wq->get_scale_num() * sizeof(float);
+
+    int32_t bdim = dim;
+    wq->set_bias(0, bdim, this->raw_model_data_->weight(pos), cpu_device_type);
+    pos += static_cast<size_t>(dim) * sizeof(float);
+
     qwen_layers_->wq_layers_.push_back(wq);
-    pos = pos + dim * dim + wq->get_scale_num() * sizeof(float);
   }
 
   // key
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wk = std::make_shared<op::MatmulLayer>(device_type_, config_->kv_dim_, dim, true);
+    auto wk = std::make_shared<op::MatmulLayer>(device_type_, config_->kv_dim_, dim, true, true);
     wk->set_group_size(group_size_);
     wk->set_weight(0, {config_->kv_dim_, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    pos = pos + static_cast<size_t>(config_->kv_dim_) * dim + wk->get_scale_num() * sizeof(float);
+
+    int32_t bdim = config_->kv_dim_;
+    wk->set_bias(0, bdim, this->raw_model_data_->weight(pos), cpu_device_type);
+    pos += static_cast<size_t>(config_->kv_dim_) * sizeof(float);
+
     qwen_layers_->wk_layers_.push_back(wk);
-    pos = pos + config_->kv_dim_ * dim + wk->get_scale_num() * sizeof(float);
   }
 
   // value
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wv = std::make_shared<op::MatmulLayer>(device_type_, config_->kv_dim_, dim, true);
+    auto wv = std::make_shared<op::MatmulLayer>(device_type_, config_->kv_dim_, dim, true, true);
     wv->set_group_size(group_size_);
     wv->set_weight(0, {config_->kv_dim_, dim}, this->raw_model_data_->weight(pos), cpu_device_type);
+    pos += static_cast<size_t>(config_->kv_dim_) * dim + wv->get_scale_num() * sizeof(float);
+
+    int32_t bdim = config_->kv_dim_;
+    wv->set_bias(0, bdim, this->raw_model_data_->weight(pos), cpu_device_type);
+    pos += static_cast<size_t>(config_->kv_dim_) * sizeof(float);
+
     qwen_layers_->wv_layers_.push_back(wv);
-    pos += config_->kv_dim_ * dim + wv->get_scale_num() * sizeof(float);
   }
 
   // output
@@ -253,27 +574,56 @@ void Qwen2Model::create_param_quant_layers() {
     pos = pos + dim * hidden_dim + w3->get_scale_num() * sizeof(float);
   }
 
+  // // wcls layer
+  // auto cls_layer = std::make_shared<op::MatmulLayer>(device_type_, config_->vocab_size_, dim,
+  // true); cls_layer->set_group_size(group_size_); if (config_->is_shared_weight_) {
+  //   // using token embedding weight
+  //   cls_layer->set_weight(0, {config_->vocab_size_, dim}, this->raw_model_data_->weight(pos),
+  //                         cpu_device_type);
+  // } else {
+  //   // no shared
+  //   cls_layer->set_weight(0, {config_->vocab_size_, dim}, this->raw_model_data_->weight(pos),
+  //                         cpu_device_type);
+  //   pos = pos + config_->vocab_size_ * dim + cls_layer->get_scale_num() * sizeof(float);
+  // }
+  // qwen_layers_->cls_layer_ = cls_layer;
+
+  // // embedding layer
+  // float* weight_ptr = (float*)raw_model_data_->weight(pos);
+  // qwen_layers_->embedding_layer_ = std::make_shared<op::EmbeddingLayer>(
+  //     device_type_, config_->dim_, config_->seq_len_, std::abs(config_->vocab_size_));
+  // qwen_layers_->embedding_layer_->set_weight(0, {std::abs(config_->vocab_size_), dim},
+  // weight_ptr,
+  //                                            cpu_device_type);
+  // weight_ptr += config_->vocab_size_ * dim;
+
   // wcls layer
-  auto cls_layer = std::make_shared<op::MatmulLayer>(device_type_, config_->vocab_size_, dim, true);
-  cls_layer->set_group_size(group_size_);
-  if (config_->is_shared_weight_) {
-    // using token embedding weight
-    cls_layer->set_weight(0, {config_->vocab_size_, dim}, this->raw_model_data_->weight(pos),
-                          cpu_device_type);
-  } else {
-    // no shared
+  if (!config_->is_shared_weight_) {
+    // 非共享：文件里有量化 lm_head
+    auto cls_layer =
+        std::make_shared<op::MatmulLayer>(device_type_, config_->vocab_size_, dim, true);
+    cls_layer->set_group_size(group_size_);
     cls_layer->set_weight(0, {config_->vocab_size_, dim}, this->raw_model_data_->weight(pos),
                           cpu_device_type);
     pos = pos + config_->vocab_size_ * dim + cls_layer->get_scale_num() * sizeof(float);
+    qwen_layers_->cls_layer_ = cls_layer;
   }
-  qwen_layers_->cls_layer_ = cls_layer;
 
-  // embedding layer
+  // embedding layer（legacy int8 导出这里开始是 fp32 常数区）
   float* weight_ptr = (float*)raw_model_data_->weight(pos);
   qwen_layers_->embedding_layer_ = std::make_shared<op::EmbeddingLayer>(
       device_type_, config_->dim_, config_->seq_len_, std::abs(config_->vocab_size_));
   qwen_layers_->embedding_layer_->set_weight(0, {std::abs(config_->vocab_size_), dim}, weight_ptr,
                                              cpu_device_type);
+
+  if (config_->is_shared_weight_) {
+    // 共享：cls 直接绑 embedding 的 fp32 权重，不走量化 Matmul
+    auto cls_fp32 =
+        std::make_shared<op::MatmulLayer>(device_type_, config_->vocab_size_, dim, false);
+    cls_fp32->set_weight(0, {config_->vocab_size_, dim}, weight_ptr, cpu_device_type);
+    qwen_layers_->cls_layer_ = cls_fp32;
+  }
+
   weight_ptr += config_->vocab_size_ * dim;
 
   // rmsnorm attention attention,ffn,final
@@ -501,6 +851,31 @@ void Qwen2Model::init_mem() {
   }
 
   CHECK(insert_buffer(ModelBufferType::kForwardOutput, forward_output));
+
+  // ===== Prefill block 2D temp buffers =====
+  tensor::Tensor rms_output_2d(base::DataType::kDataTypeFp32, config_->seq_len_, config_->dim_,
+                               true, alloc);
+  CHECK(insert_buffer(ModelBufferType::kOutputRMSNorm2D, rms_output_2d));
+
+  tensor::Tensor query_2d(base::DataType::kDataTypeFp32, config_->seq_len_, config_->dim_, true,
+                          alloc);
+  CHECK(insert_buffer(ModelBufferType::kQuery2D, query_2d));
+
+  CHECK(insert_buffer(ModelBufferType::kOutputMHA2D, rms_output_2d));
+  CHECK(insert_buffer(ModelBufferType::kAttnOutput2D, query_2d));
+
+  tensor::Tensor ffn_norm_2d(base::DataType::kDataTypeFp32, config_->seq_len_, config_->dim_, true,
+                             alloc);
+  CHECK(insert_buffer(ModelBufferType::kFFNRMSNorm2D, ffn_norm_2d));
+
+  tensor::Tensor w1_output_2d(base::DataType::kDataTypeFp32, config_->seq_len_,
+                              config_->hidden_dim_, true, alloc);
+  tensor::Tensor w3_output_2d(base::DataType::kDataTypeFp32, config_->seq_len_,
+                              config_->hidden_dim_, true, alloc);
+  CHECK(insert_buffer(ModelBufferType::kW1Output2D, w1_output_2d));
+  CHECK(insert_buffer(ModelBufferType::kW3Output2D, w3_output_2d));
+
+  CHECK(insert_buffer(ModelBufferType::kW2Output2D, ffn_norm_2d));
 }
 
 base::Status Qwen2Model::create_layers() {
@@ -618,6 +993,36 @@ void Qwen2Model::attention_qkv(int32_t layer_idx, const tensor::Tensor& pos_tens
       << "The RoPE layer in the attention block is null pointer.";
   STATUS_CHECK(qwen_layers_->rope_layer_->forward(
       query, key, pos_tensor, get_buffer(ModelBufferType::kSinCache),
+      get_buffer(ModelBufferType::kCosCache), tensor::Tensor{}));
+}
+
+void Qwen2Model::attention_qkv_block(int32_t layer_idx, const tensor::Tensor& pos_tensor,
+                                     const tensor::Tensor& rmsnorm_output_2d,
+                                     const tensor::Tensor& query_2d) const {
+  CHECK(qwen_layers_ != nullptr);
+  CHECK_EQ(rmsnorm_output_2d.dims_size(), 2);
+  CHECK_EQ(query_2d.dims_size(), 2);
+
+  const int32_t start_pos = pos_tensor.index<int32_t>(0);
+  const int32_t token_num = rmsnorm_output_2d.get_dim(0);
+
+  auto [key_block, val_block] = slice_kv_cache_block(layer_idx, start_pos, token_num);
+
+  const auto& query_layer = qwen_layers_->wq_layers_.at(layer_idx);
+  CHECK_NE(query_layer, nullptr);
+  STATUS_CHECK(query_layer->forward(rmsnorm_output_2d, query_2d));
+
+  const auto& key_layer = qwen_layers_->wk_layers_.at(layer_idx);
+  CHECK_NE(key_layer, nullptr);
+  STATUS_CHECK(key_layer->forward(rmsnorm_output_2d, key_block));
+
+  const auto& value_layer = qwen_layers_->wv_layers_.at(layer_idx);
+  CHECK_NE(value_layer, nullptr);
+  STATUS_CHECK(value_layer->forward(rmsnorm_output_2d, val_block));
+
+  CHECK_NE(qwen_layers_->rope_layer_, nullptr);
+  STATUS_CHECK(qwen_layers_->rope_layer_->forward(
+      query_2d, key_block, pos_tensor, get_buffer(ModelBufferType::kSinCache),
       get_buffer(ModelBufferType::kCosCache), tensor::Tensor{}));
 }
 

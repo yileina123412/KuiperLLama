@@ -132,6 +132,7 @@ def main():
 
     # 1. 加载模型和配套的tokenizer，准备进行量化和导出
     print(" 正在加载 FP16 模型...")
+    # model = AutoModelForCausalLM.from_pretrained(args.model_path, torch_dtype=torch.float16, device_map="auto")
     model = AutoModelForCausalLM.from_pretrained(args.model_path, torch_dtype=torch.float16, device_map="cpu")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     
@@ -170,6 +171,8 @@ def main():
     with torch.no_grad():
         for text in calib_texts:
             model(**tokenizer(text, return_tensors="pt"))
+            # inputs = tokenizer(text, return_tensors="pt").to(model.device)
+            # model(**inputs)
 
     # 3. 平滑折叠
     # print(" 执行数学等效折叠 (SmoothQuant)...")
@@ -212,6 +215,13 @@ def main():
             if z_flat.size % 2 != 0: z_flat = np.append(z_flat, 0)
             z_bytes = ((z_flat[1::2] << 4) | (z_flat[0::2])).astype(np.uint8).tobytes()
             s_bytes = scales.flatten().numpy().astype(np.float32).tobytes()
+
+            # q_flat = q_int.flatten().cpu().numpy()
+            # q_bytes = ((q_flat[1::2] << 4) | (q_flat[0::2])).astype(np.uint8).tobytes()
+            # z_flat = z_int.flatten().cpu().numpy()
+            # if z_flat.size % 2 != 0: z_flat = np.append(z_flat, 0)
+            # z_bytes = ((z_flat[1::2] << 4) | (z_flat[0::2])).astype(np.uint8).tobytes()
+            # s_bytes = scales.flatten().cpu().numpy().astype(np.float32).tobytes()
 
             # 写描述符 + 数据
             _write_block_descriptor(f, BLOCK_TYPE_SQ4, q_int.shape[0], q_int.shape[1],

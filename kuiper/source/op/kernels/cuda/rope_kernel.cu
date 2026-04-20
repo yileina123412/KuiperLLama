@@ -124,6 +124,46 @@ __global__ void rope_kernel_cu_fp32(int pos, int dim, int kv_dim, int head_size,
     vec[v1_idx] = fcr * v1 + fci * v0;
   }
 }
+__global__ void rope_kernel_cu_fp32_batch(int start_pos, int T, int dim, int kv_dim, int head_size,
+                                          float* q, float* k, const float* sin_cache,
+                                          const float* cos_cache) {
+  int idx = threadIdx.x + blockDim.x * blockIdx.x;  // pair index across all heads
+  int t = (int)blockIdx.y;
+  if (t >= T) return;
+
+  int num_heads = dim / head_size;
+  int head_pair_count = head_size / 2;
+  int total_pairs = num_heads * head_pair_count;
+  if (idx >= total_pairs) return;
+
+  int head_idx = idx / head_pair_count;
+  int head_dim = idx % head_pair_count;
+
+  int i = head_idx * head_size;
+  int v0_idx = i + head_dim;
+  int v1_idx = i + head_dim + head_size / 2;
+
+  int pos = start_pos + t;
+
+  // 与 QWEN 单 token 版本保持一致的查表方式
+  float fci = sin_cache[pos * head_size + head_dim * 2];
+  float fcr = cos_cache[pos * head_size + head_dim * 2];
+
+  float* q_t = q + (size_t)t * (size_t)dim;
+  float q0 = q_t[v0_idx];
+  float q1 = q_t[v1_idx];
+  q_t[v0_idx] = fcr * q0 - fci * q1;
+  q_t[v1_idx] = fcr * q1 + fci * q0;
+
+  // 仅在 kv_dim 覆盖范围内旋转 K（兼容 GQA/MQA）
+  if (i < kv_dim) {
+    float* k_t = k + (size_t)t * (size_t)kv_dim;
+    float k0 = k_t[v0_idx];
+    float k1 = k_t[v1_idx];
+    k_t[v0_idx] = fcr * k0 - fci * k1;
+    k_t[v1_idx] = fcr * k1 + fci * k0;
+  }
+}
 
 __global__ void sin_cos_calc(int head_size, int max_seq_len, float* sin_cache, float* cos_cache) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
@@ -217,26 +257,6 @@ void sin_cos_cache_calc_cu(int head_size, int max_seq_len, const tensor::Tensor&
                                  const_cast<float*>(cos_cache.ptr<float>()));
   }
 }
-
-// void rope_kernel_cu(int32_t dim, int32_t kv_dim, int32_t head_size, const tensor::Tensor&
-// input_q,
-//                     const tensor::Tensor& input_k, const tensor::Tensor& input_pos,
-//                     const tensor::Tensor& sin_cache, const tensor::Tensor& cos_cache,
-//                     void* stream) {
-//   const int32_t pos = *input_pos.ptr<int32_t>(0);
-//   int threads = 128;
-//   int blocks = (dim + threads - 1) / threads;
-//   if (stream) {
-//     cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
-//     rope_kernel_cu_fp32<<<blocks, threads, 0, stream_>>>(
-//         pos, dim, kv_dim, head_size, input_q.ptr<float>(), input_k.ptr<float>(),
-//         sin_cache.ptr<float>(), cos_cache.ptr<float>());
-//   } else {
-//     rope_kernel_cu_fp32<<<blocks, threads>>>(pos, dim, kv_dim, head_size, input_q.ptr<float>(),
-//                                              input_k.ptr<float>(), sin_cache.ptr<float>(),
-//                                              cos_cache.ptr<float>());
-//   }
-// }
 
 void rope_kernel_cu(int32_t dim, int32_t kv_dim, int32_t head_size, const tensor::Tensor& input_q,
                     const tensor::Tensor& input_k, const tensor::Tensor& input_pos,

@@ -288,28 +288,6 @@ base::Status LLama2Model::prefill(const tensor::Tensor& input, const tensor::Ten
   return base::error::Success();
 }
 
-base::Status LLama2Model::decode_o(const tensor::Tensor& input, const tensor::Tensor& pos_tensor,
-                                   int& next) const {
-  if (input.is_empty()) {
-    return base::error::InvalidArgument("The input tensor is empty.");
-  }
-  if (device_type_ == base::DeviceType::kDeviceCPU && is_quant_model_) {
-    return base::error::InternalError("Unsupported int8 quant in the cpu device");
-  }
-
-  for (int32_t layer_idx = 0; layer_idx < config_->layer_num_; ++layer_idx) {
-    attention_rms(layer_idx, input);
-    // attention (wq wk wv @ input)
-    attention_qkv(layer_idx, pos_tensor);  // ← 关键：无论 Prefill 还是 Decode 都要执行
-    // multi-head attention
-    attention_mha(layer_idx, pos_tensor);
-    // feed forward
-    feed_forward(layer_idx, input);
-  }
-  cls_logits(input);
-  return base::error::Success();
-}
-
 void LLama2Model::create_nonparam_layers() {
   CHECK(llama_layers_ != nullptr);
   llama_layers_->rope_layer_ = std::make_shared<op::RoPELayer>(
@@ -331,51 +309,6 @@ void LLama2Model::create_param_quant_layers() {
   // 单独写一个分支
   if (quant_format() == QuantFormat::kSQ4) {
     auto cpu_device_type = base::DeviceType::kDeviceCPU;
-    // 读取环境变量
-    const char* env_cstr = std::getenv("KUIPER_SQ4_DEQUANT");
-    std::string env = env_cstr ? std::string(env_cstr) : std::string("w2");
-
-    const char* last_cstr = std::getenv("KUIPER_SQ4_DEQUANT_LAST_N");
-    int dequant_last_n = last_cstr ? std::atoi(last_cstr) : 1;
-
-    auto to_lower = [](std::string s) -> std::string {
-      for (char& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-      return s;
-    };
-
-    auto split_tokens = [&](const std::string& s) -> std::unordered_set<std::string> {
-      std::unordered_set<std::string> out;
-      std::string cur;
-      for (char ch : s) {
-        if (ch == ',' || ch == ' ' || ch == '\t' || ch == ';' || ch == '|') {
-          if (!cur.empty()) {
-            out.insert(to_lower(cur));
-            cur.clear();
-          }
-        } else {
-          cur.push_back(ch);
-        }
-      }
-      if (!cur.empty()) out.insert(to_lower(cur));
-      return out;
-    };
-
-    const auto tokens = split_tokens(env);
-
-    auto should_dequant_tag = [&](const char* tag) -> bool {
-      if (!tag) return false;
-      if (tokens.count("none")) return false;
-      if (tokens.count("all")) return true;
-      return tokens.count(to_lower(std::string(tag))) > 0;
-    };
-
-    auto should_dequant_here = [&](const char* tag, int32_t layer_idx) -> bool {
-      if (!should_dequant_tag(tag)) return false;
-      if (layer_idx < 0) return true;        // e.g. lm_head
-      if (dequant_last_n <= 0) return true;  // <=0 means no restriction
-      const int32_t start = std::max<int32_t>(0, config_->layer_num_ - dequant_last_n);
-      return layer_idx >= start;
-    };
 
     const uint8_t* begin = reinterpret_cast<const uint8_t*>(raw_model_data_->weight_data);
     const uint8_t* end =
@@ -386,56 +319,14 @@ void LLama2Model::create_param_quant_layers() {
     const int32_t dim = config_->dim_;
     const int32_t hidden_dim = config_->hidden_dim_;
     // 读取一个SQ4量化块，并根据反量化策略返回对应的计算层
+    // 读取一个SQ4量化块，始终按SQ4权重层构建（不做提前反量化）
     auto read_sq4_matmul = [&](const char* tag, int32_t layer_idx, int32_t rows,
                                int32_t cols) -> std::shared_ptr<op::Layer> {
+      (void)tag;
+      (void)layer_idx;
+
       model::QuantBlockPayload payload;
       STATUS_CHECK(cursor.ReadNextSQ4(rows, cols, group_size_, &payload, true));
-
-      if (should_dequant_here(tag, layer_idx)) {
-        CHECK_GT(payload.desc.group_size, 0);
-        CHECK_EQ(payload.desc.cols % payload.desc.group_size, 0)
-            << "SQ4 dequant requires cols % group_size == 0";
-
-        const int32_t M = payload.desc.rows;
-        const int32_t K = payload.desc.cols;
-        const int32_t gsz = payload.desc.group_size;
-        const int32_t groups_per_row = K / gsz;
-
-        const size_t bytes = static_cast<size_t>(M) * static_cast<size_t>(K) * sizeof(float);
-        auto cpu_alloc = base::CPUDeviceAllocatorFactory::get_instance();
-        auto owned = std::make_shared<base::Buffer>(bytes, cpu_alloc);
-        float* out = reinterpret_cast<float*>(owned->ptr());
-        CHECK_NE(out, nullptr);
-
-        auto load_nibble = [](const uint8_t* p, size_t idx) -> uint8_t {
-          const uint8_t byte = p[idx >> 1];
-          return (idx & 1) ? (byte >> 4) : (byte & 0x0F);
-        };
-
-        const float* scales = reinterpret_cast<const float*>(payload.s);
-        for (int32_t r = 0; r < M; ++r) {
-          for (int32_t c = 0; c < K; ++c) {
-            const int32_t g = c / gsz;
-            const size_t group_idx = static_cast<size_t>(r) * static_cast<size_t>(groups_per_row) +
-                                     static_cast<size_t>(g);
-            const size_t w_idx =
-                static_cast<size_t>(r) * static_cast<size_t>(K) + static_cast<size_t>(c);
-
-            const uint8_t q4 = load_nibble(payload.q, w_idx);
-            const uint8_t z4 = load_nibble(payload.z, group_idx);
-            const float s = scales[group_idx];
-            out[w_idx] = (static_cast<float>(int(q4) - int(z4))) * s;
-          }
-        }
-
-        llama_layers_->owned_fp32_weights_.push_back(owned);
-
-        auto layer = std::make_shared<op::MatmulLayer>(device_type_, rows, cols, false);
-        STATUS_CHECK(layer->set_weight(0, {rows, cols}, out, cpu_device_type));
-        LOG(INFO) << "SQ4 hybrid: dequant->fp32 tag=" << (tag ? tag : "?") << " layer=" << layer_idx
-                  << " (" << rows << "x" << cols << ")";
-        return layer;
-      }
 
       op::SQ4WeightView view;
       view.rows = payload.desc.rows;

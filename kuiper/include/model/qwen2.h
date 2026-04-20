@@ -1,7 +1,9 @@
 #ifndef KUIPER_INCLUDE_MODEL_LLAMA_H_
 #define KUIPER_INCLUDE_MODEL_LLAMA_H_
 #include <base/cuda_config.h>
+#include <op/matmul_sq4.h>
 #include "model.h"
+#include "model/quant_cursor.h"
 #include "op/add.h"
 #include "op/embedding.h"
 #include "op/rope.h"
@@ -37,6 +39,8 @@ class Qwen2Model : public Model {
                       QuantFormat quant_format = QuantFormat::kInt8Q8);
 
   base::Status init(base::DeviceType device_type) override;
+  base::Status prefill(const tensor::Tensor& input, const tensor::Tensor& pos_tensor,
+                       int& next) const override;
 
   base::Status predict(const tensor::Tensor& input, const tensor::Tensor& pos_tensor,
                        bool is_prompt, int& next) const override;
@@ -64,6 +68,10 @@ class Qwen2Model : public Model {
   void feed_forward(int32_t layer_idx, const tensor::Tensor& input) const;
 
   void attention_qkv(int32_t layer_idx, const tensor::Tensor& pos_tensor) const;
+
+  void attention_qkv_block(int32_t layer_idx, const tensor::Tensor& pos_tensor,
+                           const tensor::Tensor& rmsnorm_output_2d,
+                           const tensor::Tensor& query_2d) const;
 
   void cls_logits(const tensor::Tensor& input) const;
 

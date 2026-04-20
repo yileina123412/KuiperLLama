@@ -37,8 +37,6 @@ struct LLama2Layers {
 
   std::shared_ptr<op::Layer> embedding_layer_;  // 词嵌入输出层
 
-  std::vector<std::shared_ptr<base::Buffer>> owned_fp32_weights_;
-
   void to_cuda(std::shared_ptr<kernel::CudaConfig> config);
 };
 // 主控制器 负责加载模型权重，管理内存以及执行推理流程
@@ -58,8 +56,6 @@ class LLama2Model : public Model {
 
   base::Status prefill(const tensor::Tensor& input, const tensor::Tensor& pos_tensor,
                        int& next) const override;
-  base::Status decode_o(const tensor::Tensor& input, const tensor::Tensor& pos_tensor,
-                        int& next) const override;
 
   op::EmbeddingOutput embedding(const std::vector<int>& tokens) const override;
 

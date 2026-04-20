@@ -1,65 +1,112 @@
 #include <base/base.h>
 #include <base/tick.h>
+#include <cuda_runtime_api.h>
 #include <glog/logging.h>
+#include <algorithm>
+#include <cmath>
+#include <numeric>
+#include <random>
 #include "model/llama3.h"
-int32_t generate1(const model::LLama2Model& model, const std::string& sentence, int total_steps,
-                  bool need_output = false) {
-  auto start_time = std::chrono::steady_clock::now();  // 记录开始时间
-  auto tokens = model.encode(sentence);
-  int32_t prompt_len = tokens.size();
-  LOG_IF(FATAL, tokens.empty()) << "The tokens is empty.";
-
-  int32_t pos = 0;
-  int32_t next = -1;
-  bool is_prompt = true;
-  const auto& prompt_embedding = model.embedding(tokens);
-  tensor::Tensor pos_tensor = model.get_buffer(model::ModelBufferType::kInputPos);
-
-  std::vector<int32_t> words;
-  while (pos < total_steps) {
-    pos_tensor.index<int32_t>(0) = pos;
-
-    if (prompt_len >= 2) {
-      std::vector<int32_t> prefill_tokens(tokens.begin(), tokens.end() - 1);
-      const auto& prefill_emb = model.embedding(prefill_tokens);
-      auto [prefill_input_tokens, prefill_input_embeddings, prefill_token_num] = prefill_emb;
-
-      pos_tensor.index<int32_t>(0) = 0;  // start_pos
-      int dummy_next = -1;
-      model.prefill(prefill_input_embeddings, pos_tensor, dummy_next);
-
-      // 2) 让下一步 decode 从最后一个 prompt token 开始
-      pos = prompt_len - 1;
-      is_prompt = false;
-      next = tokens.back();  // teacher-forcing 最后一个 prompt token
-    } else {
-      is_prompt = false;
-      tokens = std::vector<int32_t>{next};  // 极其关键：把刚才预测出来的 next，变成新的输入！
-      const auto& token_embedding = model.embedding(tokens);
-      tensor::Tensor input = model.fill_input(pos_tensor, token_embedding, is_prompt);
-      model.predict(input, pos_tensor, is_prompt, next);
-    }
-    if (model.is_sentence_ending(next)) {
-      break;  // 停止标志
-    }
-
-    if (is_prompt) {
-      auto end_ttft = std::chrono::steady_clock::now();
-      double ttft_ms = std::chrono::duration<double, std::milli>(end_ttft - start_time).count();
-      printf("\nTTFT: %lf ms\n", ttft_ms);
-      next = tokens.at(pos + 1);  // 强制把用户的下一个词作为答案
-      words.push_back(next);
-    } else {
-      words.push_back(next);
-    }
-
-    pos += 1;
+static int32_t sample_from_logits(const tensor::Tensor& logits_any_device,
+                                  const std::vector<int32_t>& history, float temperature = 0.85f,
+                                  int top_k = 40, float top_p = 0.92f,
+                                  float repetition_penalty = 1.10f) {
+  tensor::Tensor logits = logits_any_device;  // 拷贝一个 view，避免改模型内部 buffer
+  if (logits.device_type() == base::DeviceType::kDeviceCUDA) {
+    logits.to_cpu();
   }
-  if (need_output) {
-    printf("%s ", model.decode(words).data());
-    fflush(stdout);
+
+  const int32_t vocab = static_cast<int32_t>(logits.size());
+  const float* p = logits.ptr<float>();
+  std::vector<float> scores(p, p + vocab);
+
+  if (vocab > 0) scores[0] = -1e30f;  // <unk>
+  if (vocab > 1) scores[1] = -1e30f;  // <bos>
+
+  // repetition penalty
+  const int32_t repeat_window = 96;
+  int32_t start = static_cast<int32_t>(history.size()) - repeat_window;
+  if (start < 0) start = 0;
+  for (int32_t i = start; i < static_cast<int32_t>(history.size()); ++i) {
+    int32_t t = history[i];
+    if (t >= 0 && t < vocab) {
+      if (scores[t] > 0.f)
+        scores[t] /= repetition_penalty;
+      else
+        scores[t] *= repetition_penalty;
+    }
   }
-  return std::min(pos, total_steps);
+
+  // temperature = 0 等价 greedy
+  if (temperature <= 1e-6f) {
+    return static_cast<int32_t>(std::max_element(scores.begin(), scores.end()) - scores.begin());
+  }
+
+  for (float& x : scores) x /= temperature;
+
+  // top-k
+  std::vector<int32_t> idx(vocab);
+  std::iota(idx.begin(), idx.end(), 0);
+  if (top_k > 0 && top_k < vocab) {
+    std::partial_sort(idx.begin(), idx.begin() + top_k, idx.end(),
+                      [&](int a, int b) { return scores[a] > scores[b]; });
+    idx.resize(top_k);
+  } else {
+    std::sort(idx.begin(), idx.end(), [&](int a, int b) { return scores[a] > scores[b]; });
+  }
+
+  // softmax（数值稳定）
+  float m = -1e30f;
+  for (int i : idx) m = std::max(m, scores[i]);
+
+  std::vector<float> probs;
+  probs.reserve(idx.size());
+  float s = 0.f;
+  for (int i : idx) {
+    float e = std::exp(scores[i] - m);
+    probs.push_back(e);
+    s += e;
+  }
+  for (float& x : probs) x /= (s + 1e-12f);
+
+  // top-p
+  if (top_p < 1.f) {
+    std::vector<int> order(probs.size());
+    std::iota(order.begin(), order.end(), 0);
+    // probs 已按 idx 对应的logit降序，理论上可不排序；这里保持稳妥
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return probs[a] > probs[b]; });
+
+    float cum = 0.f;
+    int keep = 0;
+    for (int j : order) {
+      cum += probs[j];
+      keep++;
+      if (cum >= top_p) break;
+    }
+    keep = std::max(1, keep);
+
+    std::vector<int32_t> idx2;
+    std::vector<float> probs2;
+    idx2.reserve(keep);
+    probs2.reserve(keep);
+    for (int n = 0; n < keep; ++n) {
+      int j = order[n];
+      idx2.push_back(idx[j]);
+      probs2.push_back(probs[j]);
+    }
+
+    float z = 0.f;
+    for (float x : probs2) z += x;
+    for (float& x : probs2) x /= (z + 1e-12f);
+
+    static thread_local std::mt19937 gen(std::random_device{}());
+    std::discrete_distribution<int> dist(probs2.begin(), probs2.end());
+    return idx2[dist(gen)];
+  }
+
+  static thread_local std::mt19937 gen(std::random_device{}());
+  std::discrete_distribution<int> dist(probs.begin(), probs.end());
+  return idx[dist(gen)];
 }
 
 int32_t generate(const model::LLama2Model& model, const std::string& sentence, int total_steps,
@@ -107,27 +154,75 @@ int32_t generate(const model::LLama2Model& model, const std::string& sentence, i
   }
 
   // ===== 3) Decode loop (1D) =====
-  while (pos < total_steps) {
+  // while (pos < total_steps) {
+  //   pos_tensor.index<int32_t>(0) = pos;
+
+  //   std::vector<int32_t> cur_tokens = {next};
+  //   const auto& token_embedding = model.embedding(cur_tokens);
+  //   tensor::Tensor input = model.fill_input(pos_tensor, token_embedding, is_prompt);
+
+  //   model.predict(input, pos_tensor, is_prompt, next);  // next 被更新为“预测出来的 token”
+  //   if (model.is_sentence_ending(next)) {
+  //     break;
+  //   }
+
+  //   words.push_back(next);
+  //   printf("Step %d: Token ID = %d\n", pos, next);
+  //   pos += 1;
+  // }
+
+  std::vector<int32_t> history = tokens;  // 用于 repetition penalty
+
+  const int32_t max_new_tokens = total_steps;  // 希望新生成多少个
+  const int32_t min_new_tokens = 256;          // 可按需改，比如 64/128/256
+  int32_t generated = 0;
+
+  while (generated < total_steps) {
     pos_tensor.index<int32_t>(0) = pos;
 
     std::vector<int32_t> cur_tokens = {next};
     const auto& token_embedding = model.embedding(cur_tokens);
     tensor::Tensor input = model.fill_input(pos_tensor, token_embedding, is_prompt);
 
-    model.predict(input, pos_tensor, is_prompt, next);  // next 被更新为“预测出来的 token”
-    if (model.is_sentence_ending(next)) {
+    int dummy_next = -1;
+    model.forward(input, pos_tensor, dummy_next);  // 只算 logits，不用内置 argmax
+
+    // 关键：确保 CUDA stream 上的 logits 已经写完
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+      LOG(FATAL) << "cudaDeviceSynchronize failed: " << cudaGetErrorString(err);
+    }
+
+    const tensor::Tensor& logits = model.get_buffer(model::ModelBufferType::kForwardOutput);
+    // next = sample_from_logits(logits, history, 0.85f, 40, 0.92f, 1.10f);
+    next = sample_from_logits(logits, history, 0.70f, 20, 0.90f, 1.05f);
+
+    // if (model.is_sentence_ending(next)) {
+    //   break;
+    // }
+
+    // history.push_back(next);
+    // words.push_back(next);
+    // printf("Step %d: Token ID = %d\n", pos, next);
+    // pos += 1;
+    // 到达最小长度之前，忽略 EOS，避免太早停
+    if (model.is_sentence_ending(next) && generated >= min_new_tokens) {
       break;
     }
 
+    history.push_back(next);
     words.push_back(next);
-    pos += 1;
+    printf("Step %d: Token ID = %d\n", generated, next);
+
+    pos += 1;        // 绝对位置，驱动 KV cache
+    generated += 1;  // 新生成 token 计数
   }
 
   if (need_output) {
     printf("%s ", model.decode(words).data());
     fflush(stdout);
   }
-  return std::min(pos, total_steps);
+  return generated;
 }
 
 int main(int argc, char* argv[]) {
@@ -139,9 +234,10 @@ int main(int argc, char* argv[]) {
   // const char* tokenizer_path = argv[2];
   // const char* checkpoint_path =
   //     "/home/furina/models/stories110M.bin";  // e.g.
-  const char* checkpoint_path = "/home/furina/models/tinyllama_int8.bin";  // e.g.
+  // const char* checkpoint_path = "/home/furina/models/tinyllama_int8.bin";  // e.g.
   // const char* checkpoint_path = "/home/furina/models/llama2_7b_smooth_pro_v3.bin";
   // const char* checkpoint_path = "/home/furina/models/tinyllama_4bit.bin";
+  const char* checkpoint_path = "/home/furina/models/llama2_7b_smooth_pro_v3_32.bin";
 
   const char* tokenizer_path = "/home/furina/models/tokenizer.model";
   // const char* checkpoint_path =
@@ -150,10 +246,10 @@ int main(int argc, char* argv[]) {
   //                                                                                  out/model.bin
   // const char* tokenizer_path =
   //     "/home/furina/models/tokenizer.json";
+  model::LLama2Model model(base::TokenizerType::kEncodeSpe, tokenizer_path, checkpoint_path, true,
+                           model::Model::QuantFormat::kSQ4);
   // model::LLama2Model model(base::TokenizerType::kEncodeSpe, tokenizer_path, checkpoint_path,
-  // true,
-  //                          model::Model::QuantFormat::kSQ4);
-  model::LLama2Model model(base::TokenizerType::kEncodeSpe, tokenizer_path, checkpoint_path, true);
+  // true);
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
   if (!init_status) {
     LOG(FATAL) << "The model init failed, the error code is: " << init_status.get_err_code();
@@ -164,7 +260,7 @@ int main(int argc, char* argv[]) {
   auto start = std::chrono::steady_clock::now();
   printf("Generating...\n");
   fflush(stdout);
-  int steps = generate(model, sentence, 128, true);
+  int steps = generate(model, sentence, 100, true);
   auto end = std::chrono::steady_clock::now();
   auto duration = std::chrono::duration<double>(end - start).count();
   printf("\nsteps/s:%lf\n", static_cast<double>(steps) / duration);
