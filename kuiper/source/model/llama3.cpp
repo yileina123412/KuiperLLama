@@ -142,6 +142,7 @@ base::Status LLama2Model::init(base::DeviceType device_type) {
   if (!read_status) {
     return read_status;
   }
+  // 1.5g
   init_mem();
   // 旋转位置编码提前准备
   if (device_type_ == base::DeviceType::kDeviceCPU) {
@@ -722,8 +723,10 @@ void LLama2Model::init_mem() {
   CHECK(insert_buffer(ModelBufferType::kW3Output, w3_output));
 
   // kv cache  申请内存
+  // 0.043
   tensor::Tensor key_cache(base::DataType::kDataTypeFp32, config_->layer_num_, config_->seq_len_,
                            config_->kv_dim_, true, alloc);
+  // 0.043
   tensor::Tensor value_cache(base::DataType::kDataTypeFp32, config_->layer_num_, config_->seq_len_,
                              config_->kv_dim_, true, alloc);
 

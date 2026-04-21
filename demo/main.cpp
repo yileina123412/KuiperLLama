@@ -3,7 +3,9 @@
 #include <cuda_runtime_api.h>
 #include <glog/logging.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <fstream>
 #include <numeric>
 #include <random>
 #include "model/llama3.h"
@@ -138,6 +140,12 @@ int32_t generate(const model::LLama2Model& model, const std::string& sentence, i
     int dummy_next = -1;
     model.prefill(prefill_input_embeddings, pos_tensor, dummy_next);
 
+    cudaError_t prefill_sync_err = cudaDeviceSynchronize();
+    if (prefill_sync_err != cudaSuccess) {
+      LOG(FATAL) << "prefill cudaDeviceSynchronize failed: "
+                 << cudaGetErrorString(prefill_sync_err);
+    }
+
     auto end_ttft = std::chrono::steady_clock::now();
     double ttft_ms = std::chrono::duration<double, std::milli>(end_ttft - start_time).count();
     printf("\nTTFT(prefill): %lf ms\n", ttft_ms);
@@ -153,29 +161,16 @@ int32_t generate(const model::LLama2Model& model, const std::string& sentence, i
     is_prompt = false;
   }
 
-  // ===== 3) Decode loop (1D) =====
-  // while (pos < total_steps) {
-  //   pos_tensor.index<int32_t>(0) = pos;
-
-  //   std::vector<int32_t> cur_tokens = {next};
-  //   const auto& token_embedding = model.embedding(cur_tokens);
-  //   tensor::Tensor input = model.fill_input(pos_tensor, token_embedding, is_prompt);
-
-  //   model.predict(input, pos_tensor, is_prompt, next);  // next 被更新为“预测出来的 token”
-  //   if (model.is_sentence_ending(next)) {
-  //     break;
-  //   }
-
-  //   words.push_back(next);
-  //   printf("Step %d: Token ID = %d\n", pos, next);
-  //   pos += 1;
-  // }
-
   std::vector<int32_t> history = tokens;  // 用于 repetition penalty
 
   const int32_t max_new_tokens = total_steps;  // 希望新生成多少个
   const int32_t min_new_tokens = 256;          // 可按需改，比如 64/128/256
   int32_t generated = 0;
+
+  std::ofstream csv_file("generation_steps_1.1b.csv");
+  csv_file << "step,token_id,time_ms\n";  // CSV 表头
+
+  auto prev_time = std::chrono::steady_clock::now();
 
   while (generated < total_steps) {
     pos_tensor.index<int32_t>(0) = pos;
@@ -212,7 +207,11 @@ int32_t generate(const model::LLama2Model& model, const std::string& sentence, i
 
     history.push_back(next);
     words.push_back(next);
-    printf("Step %d: Token ID = %d\n", generated, next);
+    // printf("Step %d: Token ID = %d\n", generated, next);
+    auto cur_time = std::chrono::steady_clock::now();
+    double step_time_ms = std::chrono::duration<double, std::milli>(cur_time - prev_time).count();
+    csv_file << generated << "," << next << "," << step_time_ms << "\n";
+    prev_time = cur_time;
 
     pos += 1;        // 绝对位置，驱动 KV cache
     generated += 1;  // 新生成 token 计数
@@ -222,6 +221,8 @@ int32_t generate(const model::LLama2Model& model, const std::string& sentence, i
     printf("%s ", model.decode(words).data());
     fflush(stdout);
   }
+  csv_file.close();
+  LOG(INFO) << "Generation steps saved to generation_steps.csv";
   return generated;
 }
 
@@ -235,9 +236,10 @@ int main(int argc, char* argv[]) {
   // const char* checkpoint_path =
   //     "/home/furina/models/stories110M.bin";  // e.g.
   // const char* checkpoint_path = "/home/furina/models/tinyllama_int8.bin";  // e.g.
+  const char* checkpoint_path = "/home/furina/models/tinyllama.bin";  // e.g.
   // const char* checkpoint_path = "/home/furina/models/llama2_7b_smooth_pro_v3.bin";
   // const char* checkpoint_path = "/home/furina/models/tinyllama_4bit.bin";
-  const char* checkpoint_path = "/home/furina/models/llama2_7b_smooth_pro_v3_32.bin";
+  // const char* checkpoint_path = "/home/furina/models/llama2_7b_smooth_pro_v3_32.bin";
 
   const char* tokenizer_path = "/home/furina/models/tokenizer.model";
   // const char* checkpoint_path =
@@ -246,15 +248,15 @@ int main(int argc, char* argv[]) {
   //                                                                                  out/model.bin
   // const char* tokenizer_path =
   //     "/home/furina/models/tokenizer.json";
-  model::LLama2Model model(base::TokenizerType::kEncodeSpe, tokenizer_path, checkpoint_path, true,
-                           model::Model::QuantFormat::kSQ4);
   // model::LLama2Model model(base::TokenizerType::kEncodeSpe, tokenizer_path, checkpoint_path,
-  // true);
+  // true,
+  //                          model::Model::QuantFormat::kSQ4);
+  model::LLama2Model model(base::TokenizerType::kEncodeSpe, tokenizer_path, checkpoint_path, false);
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
   if (!init_status) {
     LOG(FATAL) << "The model init failed, the error code is: " << init_status.get_err_code();
   }
-  const std::string& sentence = "hello";
+  const std::string& sentence = "hello the world";
   // const std::string& sentence = "this is a test,please answer me in English.";
 
   auto start = std::chrono::steady_clock::now();
