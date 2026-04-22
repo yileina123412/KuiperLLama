@@ -5,9 +5,8 @@
 namespace op {
 class MultiHeadAttention : public op::Layer {
  public:
-  explicit MultiHeadAttention(base::DeviceType device_type, int32_t layer_index,
-                              int32_t kv_mul, int32_t kv_dim, int32_t seq_len,
-                              int32_t head_num, int32_t head_size);
+  explicit MultiHeadAttention(base::DeviceType device_type, int32_t layer_index, int32_t kv_mul,
+                              int32_t kv_dim, int32_t seq_len, int32_t head_num, int32_t head_size);
 
   base::Status check() const override;
 
@@ -15,6 +14,10 @@ class MultiHeadAttention : public op::Layer {
   void set_layer_idx(int32_t layer_idx);
 
   base::Status forward() override;
+
+  void set_kv_window_size(int32_t kv_window_size);
+  void set_kv_valid_len(int32_t kv_valid_len);
+  void set_kv_prefix_keep_tokens(int32_t n);
 
  private:
   int32_t layer_index_ = 0;
@@ -24,6 +27,10 @@ class MultiHeadAttention : public op::Layer {
   int32_t seq_len_ = 0;
   int32_t head_num_ = 0;
   int32_t head_size_ = 0;
+
+  int32_t kv_window_size_ = 0;
+  int32_t kv_valid_len_ = 0;
+  int32_t kv_prefix_keep_tokens_ = 0;
 };
 }  // namespace op
 #endif  // KUIPER_INLCUDE_MHA_H

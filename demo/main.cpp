@@ -160,6 +160,33 @@ int32_t generate(const model::LLama2Model& model, const std::string& sentence, i
     next = tokens[0];
     is_prompt = false;
   }
+  // // 临时decode only
+  // if (prompt_len >= 2) {
+  //   for (int32_t i = 0; i < prompt_len - 1; i++) {
+  //     pos_tensor.index<int32_t>(0) = i;
+  //     std::vector<int32_t> warm_tokens = {tokens[i]};
+  //     const auto& warm_emb = model.embedding(warm_tokens);
+  //     tensor::Tensor warm_input = model.fill_input(pos_tensor, warm_emb, false);
+  //     int dummy_next = -1;
+  //     model.forward(warm_input, pos_tensor, dummy_next);
+  //   }
+  //   cudaError_t warm_sync_err = cudaDeviceSynchronize();
+  //   if (warm_sync_err != cudaSuccess) {
+  //     LOG(FATAL) << "warmup cudaDeviceSynchronize failed: " << cudaGetErrorString(warm_sync_err);
+  //   }
+
+  //   auto end_ttft = std::chrono::steady_clock::now();
+  //   double ttft_ms = std::chrono::duration<double, std::milli>(end_ttft - start_time).count();
+  //   printf("\nTTFT(warmup-decode): %lf ms\n", ttft_ms);
+
+  //   pos = prompt_len - 1;
+  //   next = tokens.back();
+  //   is_prompt = false;
+  // } else {
+  //   pos = 0;
+  //   next = tokens[0];
+  //   is_prompt = false;
+  // }
 
   std::vector<int32_t> history = tokens;  // 用于 repetition penalty
 
@@ -253,16 +280,18 @@ int main(int argc, char* argv[]) {
   //                          model::Model::QuantFormat::kSQ4);
   model::LLama2Model model(base::TokenizerType::kEncodeSpe, tokenizer_path, checkpoint_path, false);
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
+  model.set_kv_window_size(256);  // 先用 256 做实验
+  model.reset_kv_total_tokens();  // 可选，当前阶段主要用 pos 计算 valid_len
   if (!init_status) {
     LOG(FATAL) << "The model init failed, the error code is: " << init_status.get_err_code();
   }
-  const std::string& sentence = "hello the world";
+  const std::string& sentence = "做一下自我介绍";
   // const std::string& sentence = "this is a test,please answer me in English.";
 
   auto start = std::chrono::steady_clock::now();
   printf("Generating...\n");
   fflush(stdout);
-  int steps = generate(model, sentence, 100, true);
+  int steps = generate(model, sentence, 1000, true);
   auto end = std::chrono::steady_clock::now();
   auto duration = std::chrono::duration<double>(end - start).count();
   printf("\nsteps/s:%lf\n", static_cast<double>(steps) / duration);

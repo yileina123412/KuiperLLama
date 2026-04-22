@@ -23,6 +23,22 @@ static tensor::Tensor row_view_fp32(const tensor::Tensor& mat2d, int32_t row, in
   v.set_device_type(device_type);
   return v;
 }
+
+static tensor::Tensor rows_view_fp32(const tensor::Tensor& mat2d, int32_t row_start,
+                                     int32_t row_num, int32_t dim, base::DeviceType device_type) {
+  CHECK_EQ(mat2d.dims_size(), 2);
+  CHECK_GE(row_start, 0);
+  CHECK_GT(row_num, 0);
+  CHECK_LE(row_start + row_num, mat2d.get_dim(0));
+
+  float* base_ptr = const_cast<float*>(mat2d.ptr<float>(static_cast<int64_t>(row_start) * dim));
+  auto buf = std::make_shared<base::Buffer>(static_cast<size_t>(row_num) * dim * sizeof(float),
+                                            nullptr, base_ptr, true);
+  tensor::Tensor v(base::DataType::kDataTypeFp32, row_num, dim);
+  CHECK(v.assign(buf));
+  v.set_device_type(device_type);
+  return v;
+}
 // 把里面所有层转到cuda
 void LLama2Layers::to_cuda(std::shared_ptr<kernel::CudaConfig> config) {
   if (add_layer_) {
@@ -190,6 +206,14 @@ base::Status LLama2Model::prefill(const tensor::Tensor& input, const tensor::Ten
   if (device_type_ == base::DeviceType::kDeviceCPU && is_quant_model_) {
     return base::error::InternalError("Unsupported int8 quant in the cpu device");
   }
+  if (input.dims_size() == 2) {
+    const int32_t token_num = input.get_dim(0);
+    const int32_t window = effective_kv_window_size();
+    if (token_num > window) {
+      LOG(WARNING) << "Prefill token_num(" << token_num << ") > kv_window(" << window
+                   << "), only the latest window tokens are retained.";
+    }
+  }
 
   for (int32_t layer_idx = 0; layer_idx < config_->layer_num_; ++layer_idx) {
     if (input.dims_size() == 1) {
@@ -226,8 +250,11 @@ base::Status LLama2Model::prefill(const tensor::Tensor& input, const tensor::Ten
       auto mha_layer = llama_layers_->mha_layer_;
       CHECK_NE(mha_layer, nullptr);
       const int32_t start_pos = pos_tensor.index<int32_t>(0);
-      std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer)->set_pos(start_pos);
-      std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer)->set_layer_idx(layer_idx);
+      auto mha_ptr = std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer);
+      mha_ptr->set_pos(start_pos);
+      mha_ptr->set_layer_idx(layer_idx);
+      mha_ptr->set_kv_window_size(effective_kv_window_size());
+      mha_ptr->set_kv_valid_len(0);
 
       tensor::Tensor score_storage = get_buffer(ModelBufferType::kScoreStorage);  // 占位参数
       tensor::Tensor key_cache = get_buffer(ModelBufferType::kKeyCache);
@@ -927,6 +954,40 @@ void LLama2Model::attention_qkv(int32_t layer_idx, const tensor::Tensor& pos_ten
       get_buffer(ModelBufferType::kCosCache), tensor::Tensor{}));
 }
 
+// void LLama2Model::attention_qkv_block(int32_t layer_idx, const tensor::Tensor& pos_tensor,
+//                                       const tensor::Tensor& rmsnorm_output_2d,
+//                                       const tensor::Tensor& query_2d) const {
+//   CHECK(llama_layers_ != nullptr);
+//   CHECK_EQ(rmsnorm_output_2d.dims_size(), 2);
+//   CHECK_EQ(query_2d.dims_size(), 2);
+
+//   const int32_t start_pos = pos_tensor.index<int32_t>(0);
+//   const int32_t token_num = rmsnorm_output_2d.get_dim(0);
+
+//   // 一次切出 KV cache 连续区间 view: [token_num, kv_dim]
+//   auto [key_block, val_block] = slice_kv_cache_block(layer_idx, start_pos, token_num);
+
+//   // wq
+//   const auto& query_layer = llama_layers_->wq_layers_.at(layer_idx);
+//   CHECK_NE(query_layer, nullptr);
+//   STATUS_CHECK(query_layer->forward(rmsnorm_output_2d, query_2d));
+
+//   // wk/wv 直接写进 cache block（核心：一次写 KV cache）
+//   const auto& key_layer = llama_layers_->wk_layers_.at(layer_idx);
+//   CHECK_NE(key_layer, nullptr);
+//   STATUS_CHECK(key_layer->forward(rmsnorm_output_2d, key_block));
+
+//   const auto& value_layer = llama_layers_->wv_layers_.at(layer_idx);
+//   CHECK_NE(value_layer, nullptr);
+//   STATUS_CHECK(value_layer->forward(rmsnorm_output_2d, val_block));
+
+//   // rope: 2D 语义使用 start_pos + t（你前面已实现）
+//   CHECK_NE(llama_layers_->rope_layer_, nullptr);
+//   STATUS_CHECK(llama_layers_->rope_layer_->forward(
+//       query_2d, key_block, pos_tensor, get_buffer(ModelBufferType::kSinCache),
+//       get_buffer(ModelBufferType::kCosCache), tensor::Tensor{}));
+// }
+
 void LLama2Model::attention_qkv_block(int32_t layer_idx, const tensor::Tensor& pos_tensor,
                                       const tensor::Tensor& rmsnorm_output_2d,
                                       const tensor::Tensor& query_2d) const {
@@ -937,28 +998,42 @@ void LLama2Model::attention_qkv_block(int32_t layer_idx, const tensor::Tensor& p
   const int32_t start_pos = pos_tensor.index<int32_t>(0);
   const int32_t token_num = rmsnorm_output_2d.get_dim(0);
 
-  // 一次切出 KV cache 连续区间 view: [token_num, kv_dim]
-  auto [key_block, val_block] = slice_kv_cache_block(layer_idx, start_pos, token_num);
-
-  // wq
+  // 1) WQ 一次做完整块
   const auto& query_layer = llama_layers_->wq_layers_.at(layer_idx);
   CHECK_NE(query_layer, nullptr);
   STATUS_CHECK(query_layer->forward(rmsnorm_output_2d, query_2d));
 
-  // wk/wv 直接写进 cache block（核心：一次写 KV cache）
   const auto& key_layer = llama_layers_->wk_layers_.at(layer_idx);
-  CHECK_NE(key_layer, nullptr);
-  STATUS_CHECK(key_layer->forward(rmsnorm_output_2d, key_block));
-
   const auto& value_layer = llama_layers_->wv_layers_.at(layer_idx);
+  CHECK_NE(key_layer, nullptr);
   CHECK_NE(value_layer, nullptr);
-  STATUS_CHECK(value_layer->forward(rmsnorm_output_2d, val_block));
-
-  // rope: 2D 语义使用 start_pos + t（你前面已实现）
   CHECK_NE(llama_layers_->rope_layer_, nullptr);
-  STATUS_CHECK(llama_layers_->rope_layer_->forward(
-      query_2d, key_block, pos_tensor, get_buffer(ModelBufferType::kSinCache),
-      get_buffer(ModelBufferType::kCosCache), tensor::Tensor{}));
+
+  // 2) WK/WV + RoPE 分 chunk（处理跨环回）
+  int32_t done = 0;
+  while (done < token_num) {
+    const int32_t cur_start_pos = start_pos + done;
+    const int32_t remain = token_num - done;
+
+    auto [key_block, val_block] = slice_kv_cache_block(layer_idx, cur_start_pos, remain);
+    const int32_t chunk = key_block.get_dim(0);
+    CHECK_GT(chunk, 0);
+
+    tensor::Tensor rms_chunk =
+        rows_view_fp32(rmsnorm_output_2d, done, chunk, config_->dim_, device_type_);
+    tensor::Tensor query_chunk = rows_view_fp32(query_2d, done, chunk, config_->dim_, device_type_);
+
+    STATUS_CHECK(key_layer->forward(rms_chunk, key_block));
+    STATUS_CHECK(value_layer->forward(rms_chunk, val_block));
+
+    tensor::Tensor pos_chunk = get_buffer(ModelBufferType::kInputPos);
+    pos_chunk.index<int32_t>(0) = cur_start_pos;
+    STATUS_CHECK(llama_layers_->rope_layer_->forward(
+        query_chunk, key_block, pos_chunk, get_buffer(ModelBufferType::kSinCache),
+        get_buffer(ModelBufferType::kCosCache), tensor::Tensor{}));
+
+    done += chunk;
+  }
 }
 
 base::Status LLama2Model::predict(const tensor::Tensor& input, const tensor::Tensor& pos_tensor,
@@ -987,8 +1062,23 @@ void LLama2Model::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_ten
   const auto& mha_layer = llama_layers_->mha_layer_;
   CHECK_NE(mha_layer, nullptr) << "The multi head attention layer is null pointer.";
   int pos = pos_tensor.index<int32_t>(0);
-  std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer)->set_pos(pos);
-  std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer)->set_layer_idx(layer_idx);
+  auto mha_ptr = std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer);
+  CHECK_NE(mha_ptr, nullptr);
+
+  const int32_t window = effective_kv_window_size();
+  int32_t valid_len = pos + 1;
+  if (valid_len > window) {
+    valid_len = window;
+  }
+
+  if (valid_len <= 0) {
+    valid_len = 1;
+  }
+
+  mha_ptr->set_pos(pos);
+  mha_ptr->set_layer_idx(layer_idx);
+  mha_ptr->set_kv_window_size(window);
+  mha_ptr->set_kv_valid_len(valid_len);
   STATUS_CHECK(mha_layer->forward(query, score_storage, key_cache, val_cache, mha_output));
 
   // wo @ attention output

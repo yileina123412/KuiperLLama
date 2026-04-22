@@ -58,16 +58,16 @@ TEST(test_mha_cu, mha_prefill_batch_cpu_vs_cuda) {
 
   // CPU reference
   kernel::get_mha_kernel(base::DeviceType::kDeviceCPU)(
-      start_pos, head_num, layer_index, seq_len, kv_dim, kv_mul, head_size, out_cpu, q_cpu,
-      score_cpu, kcache_cpu, vcache_cpu, base::DeviceType::kDeviceCPU, nullptr);
+      start_pos, head_num, layer_index, seq_len, kv_dim, kv_mul, head_size, seq_len, start_pos + T,
+      out_cpu, q_cpu, score_cpu, kcache_cpu, vcache_cpu, base::DeviceType::kDeviceCPU, nullptr);
 
   // CUDA
   kernel::CudaConfig config;
   cudaStreamCreate(&config.stream);
 
   kernel::get_mha_kernel(base::DeviceType::kDeviceCUDA)(
-      start_pos, head_num, layer_index, seq_len, kv_dim, kv_mul, head_size, out_cu, q_cu, score_cu,
-      kcache_cu, vcache_cu, base::DeviceType::kDeviceCUDA, &config);
+      start_pos, head_num, layer_index, seq_len, kv_dim, kv_mul, head_size, seq_len, start_pos + T,
+      out_cu, q_cu, score_cu, kcache_cu, vcache_cu, base::DeviceType::kDeviceCUDA, &config);
 
   cudaStreamSynchronize(config.stream);
   out_cu.to_cpu();

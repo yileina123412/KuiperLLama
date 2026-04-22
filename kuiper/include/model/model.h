@@ -67,6 +67,19 @@ class Model {
   /////////////////////////////////////////////////////
   // 输入文本转换为Token ID序列
   virtual std::vector<int32_t> encode(const std::string& sentence) const;
+
+  // kv 滑动窗口
+  void set_kv_window_size(int32_t kv_window_size);
+  int32_t kv_window_size() const;
+  int64_t kv_total_tokens() const;  // 已写入的token总数
+  void set_kv_total_tokens(int64_t n);
+  void advance_kv_total_tokens(int32_t delta);
+  void reset_kv_total_tokens();
+  int32_t kv_valid_token_num() const;
+
+  void set_kv_prefix_keep_tokens(int32_t n);
+  int32_t kv_prefix_keep_tokens() const;
+
   // 从KV Cache中切片获取特定层和位置的键值对
   virtual std::pair<tensor::Tensor, tensor::Tensor> slice_kv_cache(int32_t layer_idx,
                                                                    int32_t token_pos) const;
@@ -96,6 +109,11 @@ class Model {
   virtual base::Status generate_model_infos(const ModelConfig& config) const;
   // 推理后处理（如softmax、采样等）
   virtual int32_t post_processing(const tensor::Tensor& pos, bool is_prompt) const = 0;
+
+  // kv滑动窗口
+  int32_t logical_to_kv_slot(int64_t logical_pos) const;
+  int32_t effective_kv_window_size() const;
+  int32_t effective_kv_prefix_keep_tokens() const;
 
  private:
   virtual void init_mem() = 0;
@@ -132,6 +150,10 @@ class Model {
   base::DeviceType device_type_ = base::DeviceType::kDeviceUnknown;           // 设备类型
   base::ModelType model_type_ = base::ModelType::kModelTypeUnknown;           // 模型类型
   base::TokenizerType tokenizer_type_ = base::TokenizerType::kEncodeUnknown;  // Tokenizer类型
+  // kv滑动窗口
+  int32_t kv_window_size_ = 0;   // 默认等于seq_len_
+  int64_t kv_total_tokens_ = 0;  // 逻辑上已写入的token总数
+  int32_t kv_prefix_keep_tokens_ = 0;
 };
 }  // namespace model
 #endif  // KUIPER_INCLUDE_MODEL_MODEL_H_
