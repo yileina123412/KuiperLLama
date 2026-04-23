@@ -112,7 +112,7 @@ static int32_t sample_from_logits(const tensor::Tensor& logits_any_device,
 }
 
 int32_t generate(const model::LLama2Model& model, const std::string& sentence, int total_steps,
-                 bool need_output = false) {
+                 const std::string& csv_path, bool need_output = false) {
   auto start_time = std::chrono::steady_clock::now();
   // 进行文本编码，得到 token 序列
   auto tokens = model.encode(sentence);
@@ -194,7 +194,7 @@ int32_t generate(const model::LLama2Model& model, const std::string& sentence, i
   const int32_t min_new_tokens = 256;          // 可按需改，比如 64/128/256
   int32_t generated = 0;
 
-  std::ofstream csv_file("generation_steps_1.1b.csv");
+  std::ofstream csv_file(csv_path);
   csv_file << "step,token_id,time_ms\n";  // CSV 表头
 
   auto prev_time = std::chrono::steady_clock::now();
@@ -228,9 +228,9 @@ int32_t generate(const model::LLama2Model& model, const std::string& sentence, i
     // printf("Step %d: Token ID = %d\n", pos, next);
     // pos += 1;
     // 到达最小长度之前，忽略 EOS，避免太早停
-    if (model.is_sentence_ending(next) && generated >= min_new_tokens) {
-      break;
-    }
+    // if (model.is_sentence_ending(next) && generated >= min_new_tokens) {
+    //   break;
+    // }
 
     history.push_back(next);
     words.push_back(next);
@@ -252,6 +252,13 @@ int32_t generate(const model::LLama2Model& model, const std::string& sentence, i
   LOG(INFO) << "Generation steps saved to generation_steps.csv";
   return generated;
 }
+
+struct ExpCase {
+  int window;
+  int prefix;
+  int steps;
+  std::string tag;
+};
 
 int main(int argc, char* argv[]) {
   // if (argc != 3) {
@@ -280,21 +287,49 @@ int main(int argc, char* argv[]) {
   //                          model::Model::QuantFormat::kSQ4);
   model::LLama2Model model(base::TokenizerType::kEncodeSpe, tokenizer_path, checkpoint_path, false);
   auto init_status = model.init(base::DeviceType::kDeviceCUDA);
-  model.set_kv_window_size(256);  // 先用 256 做实验
-  model.reset_kv_total_tokens();  // 可选，当前阶段主要用 pos 计算 valid_len
+  model.set_kv_window_size(2048);  // 先用 256 做实验
+  model.reset_kv_total_tokens();   // 可选，当前阶段主要用 pos 计算 valid_len
   if (!init_status) {
     LOG(FATAL) << "The model init failed, the error code is: " << init_status.get_err_code();
   }
   const std::string& sentence = "做一下自我介绍";
+
+  const std::vector<ExpCase> cases = {
+      {2048, 0, 1000, "baseline_w2048_p0"},
+      {256, 0, 1000, "window_w256_p0"},
+      {256, 64, 1000, "prefix_w256_p64"},
+      {128, 32, 1000, "prefix_w128_p32"},
+  };
+  for (const auto& c : cases) {
+    model.set_kv_window_size(c.window);
+    model.set_kv_prefix_keep_tokens(c.prefix);
+    model.reset_kv_total_tokens();
+
+    std::string csv_name = "generation_steps_" + c.tag + ".csv";
+
+    auto start = std::chrono::steady_clock::now();
+    printf("\n=== CASE: %s (window=%d, prefix=%d) ===\n", c.tag.c_str(), c.window, c.prefix);
+    fflush(stdout);
+
+    int gen_steps = generate(model, sentence, c.steps, csv_name, true);
+
+    auto end = std::chrono::steady_clock::now();
+    double duration = std::chrono::duration<double>(end - start).count();
+    double sps = gen_steps / std::max(duration, 1e-9);
+
+    printf("case=%s, generated=%d, time=%.3f s, steps/s=%.3f, csv=%s\n", c.tag.c_str(), gen_steps,
+           duration, sps, csv_name.c_str());
+    fflush(stdout);
+  }
   // const std::string& sentence = "this is a test,please answer me in English.";
 
-  auto start = std::chrono::steady_clock::now();
-  printf("Generating...\n");
-  fflush(stdout);
-  int steps = generate(model, sentence, 1000, true);
-  auto end = std::chrono::steady_clock::now();
-  auto duration = std::chrono::duration<double>(end - start).count();
-  printf("\nsteps/s:%lf\n", static_cast<double>(steps) / duration);
-  fflush(stdout);
+  // auto start = std::chrono::steady_clock::now();
+  // printf("Generating...\n");
+  // fflush(stdout);
+  // int steps = generate(model, sentence, 1000, true);
+  // auto end = std::chrono::steady_clock::now();
+  // auto duration = std::chrono::duration<double>(end - start).count();
+  // printf("\nsteps/s:%lf\n", static_cast<double>(steps) / duration);
+  // fflush(stdout);
   return 0;
 }

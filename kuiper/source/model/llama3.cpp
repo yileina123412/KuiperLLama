@@ -255,6 +255,7 @@ base::Status LLama2Model::prefill(const tensor::Tensor& input, const tensor::Ten
       mha_ptr->set_layer_idx(layer_idx);
       mha_ptr->set_kv_window_size(effective_kv_window_size());
       mha_ptr->set_kv_valid_len(0);
+      mha_ptr->set_kv_prefix_keep_tokens(effective_kv_prefix_keep_tokens());
 
       tensor::Tensor score_storage = get_buffer(ModelBufferType::kScoreStorage);  // 占位参数
       tensor::Tensor key_cache = get_buffer(ModelBufferType::kKeyCache);
@@ -1079,6 +1080,7 @@ void LLama2Model::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_ten
   mha_ptr->set_layer_idx(layer_idx);
   mha_ptr->set_kv_window_size(window);
   mha_ptr->set_kv_valid_len(valid_len);
+  mha_ptr->set_kv_prefix_keep_tokens(effective_kv_prefix_keep_tokens());
   STATUS_CHECK(mha_layer->forward(query, score_storage, key_cache, val_cache, mha_output));
 
   // wo @ attention output

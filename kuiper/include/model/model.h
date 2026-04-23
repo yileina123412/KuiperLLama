@@ -77,6 +77,7 @@ class Model {
   void reset_kv_total_tokens();
   int32_t kv_valid_token_num() const;
 
+  // prefix keep tokens: 前 P 个逻辑 token 固定保留，不被覆盖
   void set_kv_prefix_keep_tokens(int32_t n);
   int32_t kv_prefix_keep_tokens() const;
 

@@ -71,30 +71,29 @@ int32_t Model::kv_valid_token_num() const {
   return kv_total_tokens_ < w ? static_cast<int32_t>(kv_total_tokens_) : w;
 }
 
+// int32_t Model::logical_to_kv_slot(int64_t logical_pos) const {
+//   CHECK_GE(logical_pos, 0);
+//   const int32_t window = effective_kv_window_size();
+//   return static_cast<int32_t>(logical_pos % window);
+// }
+// 重新计算位置
 int32_t Model::logical_to_kv_slot(int64_t logical_pos) const {
   CHECK_GE(logical_pos, 0);
   const int32_t window = effective_kv_window_size();
-  return static_cast<int32_t>(logical_pos % window);
+  const int32_t prefix = effective_kv_prefix_keep_tokens();
+  // 没有设置前缀
+  if (prefix <= 0) {
+    return static_cast<int32_t>(logical_pos % window);
+  }
+  if (logical_pos < prefix) {
+    return static_cast<int32_t>(logical_pos);
+  }
+  const int32_t ring = window - prefix;
+  CHECK_GT(ring, 0);
+  const int64_t rel = logical_pos - prefix;
+  return prefix + static_cast<int32_t>(rel % ring);
 }
-// int32_t Model::logical_to_kv_slot(int64_t logical_pos) const {
-//   CHECK_GE(logical_pos, 0);
 
-//   const int32_t window = effective_kv_window_size();
-//   const int32_t prefix = effective_kv_prefix_keep_tokens();
-
-//   if (prefix <= 0) {
-//     return static_cast<int32_t>(logical_pos % window);
-//   }
-
-//   if (logical_pos < prefix) {
-//     return static_cast<int32_t>(logical_pos);  // 前缀固定槽位 [0, prefix)
-//   }
-
-//   const int32_t ring = window - prefix;
-//   CHECK_GT(ring, 0);
-//   const int64_t rel = logical_pos - prefix;
-//   return prefix + static_cast<int32_t>(rel % ring);  // 尾部环 [prefix, window)
-// }
 int32_t Model::effective_kv_window_size() const {
   CHECK(config_ != nullptr);
   CHECK_GT(config_->seq_len_, 0);
@@ -307,26 +306,7 @@ std::string Model::decode(std::vector<int32_t> token_idxs) const {
 这意味着函数假设：每次调用都会生成新的 K,V
 但问题是：Prefill 时都已经算过并存储了，Decode 时又要再算一遍！
  */
-// std::pair<tensor::Tensor, tensor::Tensor> Model::slice_kv_cache(int32_t layer_idx,
-//                                                                 int32_t token_pos) const {
-//   // 本层的序号
-//   int32_t layer_offset = layer_idx * config_->seq_len_ * config_->kv_dim_;
-//   // 当前位置
-//   int32_t cache_offset = layer_offset + token_pos * config_->kv_dim_;
 
-//   float* key_cache_ptr =
-//       const_cast<float*>(get_buffer(ModelBufferType::kKeyCache).ptr<float>(cache_offset));
-//   float* val_cache_ptr =
-//       const_cast<float*>(get_buffer(ModelBufferType::kValueCache).ptr<float>(cache_offset));
-
-//   tensor::Tensor key(base::DataType::kDataTypeFp32, config_->kv_dim_, false, nullptr,
-//                      key_cache_ptr);
-//   tensor::Tensor val(base::DataType::kDataTypeFp32, config_->kv_dim_, false, nullptr,
-//                      val_cache_ptr);
-//   key.set_device_type(device_type_);
-//   val.set_device_type(device_type_);
-//   return {key, val};
-// }
 // 环形槽位
 std::pair<tensor::Tensor, tensor::Tensor> Model::slice_kv_cache(int32_t layer_idx,
                                                                 int32_t token_pos) const {
@@ -351,32 +331,7 @@ std::pair<tensor::Tensor, tensor::Tensor> Model::slice_kv_cache(int32_t layer_id
   val.set_device_type(device_type_);
   return {key, val};
 }
-// std::pair<tensor::Tensor, tensor::Tensor> Model::slice_kv_cache_block(int32_t layer_idx,
-//                                                                       int32_t start_pos,
-//                                                                       int32_t token_num) const {
-//   CHECK_GE(layer_idx, 0);
-//   CHECK_LT(layer_idx, config_->layer_num_);
-//   CHECK_GE(start_pos, 0);
-//   CHECK_GT(token_num, 0);
-//   CHECK_LE(start_pos + token_num, config_->seq_len_);
 
-//   const int64_t layer_stride = static_cast<int64_t>(config_->seq_len_) * config_->kv_dim_;
-//   const int64_t layer_offset = static_cast<int64_t>(layer_idx) * layer_stride;
-//   const int64_t cache_offset = layer_offset + static_cast<int64_t>(start_pos) * config_->kv_dim_;
-
-//   float* key_cache_ptr =
-//       const_cast<float*>(get_buffer(ModelBufferType::kKeyCache).ptr<float>(cache_offset));
-//   float* val_cache_ptr =
-//       const_cast<float*>(get_buffer(ModelBufferType::kValueCache).ptr<float>(cache_offset));
-
-//   tensor::Tensor key(base::DataType::kDataTypeFp32, token_num, config_->kv_dim_, false, nullptr,
-//                      key_cache_ptr);
-//   tensor::Tensor val(base::DataType::kDataTypeFp32, token_num, config_->kv_dim_, false, nullptr,
-//                      val_cache_ptr);
-//   key.set_device_type(device_type_);
-//   val.set_device_type(device_type_);
-//   return {key, val};
-// }
 std::pair<tensor::Tensor, tensor::Tensor> Model::slice_kv_cache_block(int32_t layer_idx,
                                                                       int32_t start_pos,
                                                                       int32_t token_num) const {
@@ -386,13 +341,22 @@ std::pair<tensor::Tensor, tensor::Tensor> Model::slice_kv_cache_block(int32_t la
   CHECK_GT(token_num, 0);
 
   const int32_t window = effective_kv_window_size();
+  const int32_t prefix = effective_kv_prefix_keep_tokens();
+
   CHECK_GT(window, 0);
 
   // 环形起点槽位
   const int32_t slot_start = logical_to_kv_slot(static_cast<int64_t>(start_pos));
 
   // 只返回“物理连续首段”
-  const int32_t first_chunk = std::min(token_num, window - slot_start);
+  int32_t first_chunk = token_num;
+  if (prefix > 0 && start_pos < prefix) {
+    // 逻辑还在前缀区：连续到 prefix 结束
+    first_chunk = std::min(first_chunk, prefix - start_pos);
+  } else {
+    // 在尾部
+    first_chunk = std::min(first_chunk, window - slot_start);
+  }
   CHECK_GT(first_chunk, 0);
 
   const int64_t layer_stride = static_cast<int64_t>(config_->seq_len_) * config_->kv_dim_;
