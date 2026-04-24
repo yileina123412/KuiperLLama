@@ -14,6 +14,20 @@ if (LLAMA3_SUPPORT)
 endif ()
 set_target_properties(llama_infer PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+
+# ========== Speculative Decoding Demo ==========
+add_executable(speculative_infer main_speculative.cpp)
+target_link_directories(speculative_infer PUBLIC ${PROJECT_SOURCE_DIR}/lib)
+target_link_libraries(speculative_infer llama)
+if (LLAMA3_SUPPORT)
+    message(STATUS "LINK LLAMA3 SUPPORT for speculative_infer")
+    find_package(absl REQUIRED)
+    find_package(re2 REQUIRED)
+    find_package(nlohmann_json REQUIRED)
+    target_link_libraries(speculative_infer absl::base re2::re2 nlohmann_json::nlohmann_json)
+endif ()
+set_target_properties(speculative_infer PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
 if (QWEN2_SUPPORT)
     message(STATUS "LINK QWEN2 SUPPORT")
     add_executable(qwen_infer main_qwen.cpp)

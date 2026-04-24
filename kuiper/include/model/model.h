@@ -81,6 +81,11 @@ class Model {
   void set_kv_prefix_keep_tokens(int32_t n);
   int32_t kv_prefix_keep_tokens() const;
 
+  // 投机解码
+  // 一次性配置运行时 KV 参数（最小必要接口，供 demo 统一调用）
+  void configure_kv_runtime(int32_t kv_window_size, int32_t kv_prefix_keep_tokens,
+                            bool reset_kv_total_tokens = true);
+
   // 从KV Cache中切片获取特定层和位置的键值对
   virtual std::pair<tensor::Tensor, tensor::Tensor> slice_kv_cache(int32_t layer_idx,
                                                                    int32_t token_pos) const;

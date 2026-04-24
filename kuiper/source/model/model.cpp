@@ -109,6 +109,15 @@ void Model::set_kv_prefix_keep_tokens(int32_t n) {
   kv_prefix_keep_tokens_ = n;
 }
 
+void Model::configure_kv_runtime(int32_t kv_window_size, int32_t kv_prefix_keep_tokens,
+                                 bool reset_runtime_tokens) {
+  set_kv_window_size(kv_window_size);
+  set_kv_prefix_keep_tokens(kv_prefix_keep_tokens);
+  if (reset_runtime_tokens) {
+    reset_kv_total_tokens();
+  }
+}
+
 int32_t Model::kv_prefix_keep_tokens() const { return kv_prefix_keep_tokens_; }
 
 int32_t Model::effective_kv_prefix_keep_tokens() const {

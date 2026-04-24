@@ -1,204 +1,314 @@
-// #include <cublas_v2.h>
+// #include <base/base.h>
+// #include <base/tick.h>
 // #include <cuda_runtime_api.h>
 // #include <glog/logging.h>
-// #include <gtest/gtest.h>
 // #include <algorithm>
+// #include <chrono>
 // #include <cmath>
-// #include <cstdint>
+// #include <fstream>
+// #include <numeric>
+// #include <random>
 // #include <vector>
-// #include "../source/op/kernels/cpu/matmul_kernel.h"
-// #include "../source/op/kernels/kernels_interface.h"
-// #include "/home/furina/code_learnning/cpp/cuda/KuiperLLama/test/utils.cuh"
-// #include "base/buffer.h"
-// #include "tensor/tensor.h"
-// using namespace kernel;
+// #include "model/llama3.h"
 
-// static inline int clamp_int(int v, int lo, int hi) { return std::max(lo, std::min(v, hi)); }
+// // ===== Greedy 采样（确定性）=====
+// static int32_t greedy_sample(const tensor::Tensor& logits_any_device) {
+//   tensor::Tensor logits = logits_any_device;
+//   if (logits.device_type() == base::DeviceType::kDeviceCUDA) {
+//     logits.to_cpu();
+//   }
+//   const float* p = logits.ptr<float>();
+//   const int32_t vocab = static_cast<int32_t>(logits.size());
 
-// static void build_q8_and_sq4_from_fp32(const tensor::Tensor& w_fp32, int K, int M, int
-// group_size,
-//                                        tensor::Tensor& w_q8, tensor::Tensor& s_q8,
-//                                        tensor::Tensor& qweight_sq4_packed, tensor::Tensor& s_sq4,
-//                                        tensor::Tensor& zeros_sq4_packed) {
-//   CHECK_EQ(w_fp32.dims_size(), 2);
-//   CHECK_EQ(w_fp32.get_dim(0), K);
-//   CHECK_EQ(w_fp32.get_dim(1), M);
-//   CHECK_EQ((K * M) % group_size, 0);
-
-//   const int N = K * M;
-//   const int group_cnt = N / group_size;
-
-//   // 临时保存每个4bit量化值（0~15）
-//   std::vector<uint8_t> q4((size_t)N, 0);
-
-//   for (int g = 0; g < group_cnt; ++g) {
-//     const int begin = g * group_size;
-//     const int end = begin + group_size;
-
-//     float max_abs = 0.f;
-//     for (int i = begin; i < end; ++i) {
-//       max_abs = std::max(max_abs, std::fabs(w_fp32.index<float>(i)));
-//     }
-
-//     const float scale_q8 = (max_abs < 1e-12f) ? 1.0f : (max_abs / 127.0f);
-//     const float scale_sq4 = (max_abs < 1e-12f) ? 1.0f : (max_abs / 7.0f);  // 对应零点8
-
-//     s_q8.index<float>(g) = scale_q8;
-//     s_sq4.index<float>(g) = scale_sq4;
-
-//     for (int i = begin; i < end; ++i) {
-//       const float v = w_fp32.index<float>(i);
-
-//       // qint8: deq = scale * q
-//       int q8 = (int)std::round(v / scale_q8);
-//       q8 = clamp_int(q8, -127, 127);
-//       w_q8.index<int8_t>(i) = (int8_t)q8;
-
-//       // sq4: deq = (q - z) * scale, 这里固定 z=8
-//       int q4v = (int)std::round(v / scale_sq4) + 8;
-//       q4v = clamp_int(q4v, 0, 15);
-//       q4[i] = (uint8_t)q4v;
+//   float max_val = -1e30f;
+//   int32_t max_idx = 0;
+//   for (int32_t i = 0; i < vocab; ++i) {
+//     if (p[i] > max_val) {
+//       max_val = p[i];
+//       max_idx = i;
 //     }
 //   }
-
-//   // pack q4: 两个4bit塞进1个byte，低位在前
-//   const int q_bytes = (N + 1) / 2;
-//   for (int bi = 0; bi < q_bytes; ++bi) {
-//     const int i0 = bi * 2;
-//     const int i1 = i0 + 1;
-//     const uint8_t lo = q4[i0] & 0x0F;
-//     const uint8_t hi = (i1 < N) ? (q4[i1] & 0x0F) : 0;
-//     const uint8_t packed = (uint8_t)(lo | (hi << 4));
-//     qweight_sq4_packed.index<int8_t>(bi) = (int8_t)packed;
-//   }
-
-//   // pack zeros: 每组一个4bit zero-point，这里全是8 => 0x88
-//   const int z_bytes = (group_cnt + 1) / 2;
-//   for (int bi = 0; bi < z_bytes; ++bi) {
-//     uint8_t lo = 8;
-//     uint8_t hi = 8;
-//     const int g1 = bi * 2 + 1;
-//     if (g1 >= group_cnt) hi = 0;  // 奇数尾巴
-//     zeros_sq4_packed.index<int8_t>(bi) = (int8_t)(lo | (hi << 4));
-//   }
+//   return max_idx;
 // }
 
-// int main() {
-//   auto alloc_cu = base::CUDADeviceAllocatorFactory::get_instance();
-//   auto alloc_cpu = base::CPUDeviceAllocatorFactory::get_instance();
+// // ===== 配置结构体 =====
+// struct SpeculativeConfig {
+//   int32_t draft_len = 4;         // 小模型一次草拟多少个 token
+//   int32_t max_new_tokens = 100;  // 最大新增 token 数
+//   bool strict_mode = true;       // 严格验收模式：第一个 mismatch 就丢弃所有草稿
+//   std::string output_csv = "speculative_result.csv";
+// };
 
-//   // 你可按显存调大：M/K越大越适合Ncu观察
-//   const int B = 16;            // batch
-//   const int M = 1024;          // input dim
-//   const int K = 1024;          // output dim
-//   const int group_size = 128;  // SQ4支持: 32/64/128
+// // ===== 验收结果结构体 =====
+// struct VerificationResult {
+//   std::vector<int32_t> accepted_tokens;  // 接受的 token 序列
+//   std::vector<int32_t> rejected_tokens;  // 被拒绝的 token 序列
+//   int32_t accept_count = 0;
+//   int32_t reject_count = 0;
+//   int32_t first_mismatch_pos = -1;  // 第一个不匹配的位置（-1 表示全部接受）
+// };
 
-//   CHECK_EQ((K * M) % group_size, 0);
+// // ===== 主 Speculative Decode 逻辑 =====
+// class SpeculativeDecoder {
+//  public:
+//   SpeculativeDecoder(const model::LLama2Model& draft_model, const model::LLama2Model&
+//   large_model,
+//                      const SpeculativeConfig& config)
+//       : draft_model_(draft_model), large_model_(large_model), config_(config) {}
 
-//   // input fp32 [B, M]
-//   tensor::Tensor input_cpu(base::DataType::kDataTypeFp32, B, M, true, alloc_cpu);
-//   for (int i = 0; i < B * M; ++i) {
-//     input_cpu.index<float>(i) = 0.01f * float((i % 97) - 48);
+//   // 执行 speculative decode
+//   VerificationResult decode(const std::string& prompt, int32_t num_gen_tokens) {
+//     VerificationResult result;
+
+//     // 1. Tokenize prompt（使用大模型的 tokenizer，两个模型应该一样）
+//     std::vector<int32_t> prompt_tokens = large_model_.encode(prompt);
+//     int32_t prompt_len = prompt_tokens.size();
+
+//     if (prompt_tokens.empty()) {
+//       LOG(ERROR) << "Empty prompt tokens!";
+//       return result;
+//     }
+
+//     LOG(INFO) << "Prompt length: " << prompt_len;
+
+//     // 2. Prefill：用大模型处理 prompt（累积 KV cache）
+//     this->prefill_large_model(prompt_tokens);
+
+//     // 3. Decode 循环
+//     std::vector<int32_t> generated_tokens;
+//     int32_t current_pos = prompt_len;
+
+//     while (static_cast<int32_t>(generated_tokens.size()) < num_gen_tokens) {
+//       // ===== 第一步：小模型草拟 K 个 token =====
+//       std::vector<int32_t> draft_tokens = this->draft_k_tokens(current_pos, config_.draft_len);
+
+//       if (draft_tokens.empty()) {
+//         LOG(INFO) << "Draft returned empty, stopping.";
+//         break;
+//       }
+
+//       // ===== 第二步：大模型逐 token 验收 =====
+//       VerificationResult verify_result = this->verify_draft_tokens(current_pos, draft_tokens);
+
+//       // ===== 第三步：处理验收结果 =====
+//       if (config_.strict_mode) {
+//         // 严格模式：第一个 mismatch 后全部丢弃
+//         if (verify_result.first_mismatch_pos >= 0) {
+//           // 接受 mismatch 前的 token
+//           int32_t accept_up_to = verify_result.first_mismatch_pos;
+//           for (int32_t i = 0; i < accept_up_to; ++i) {
+//             generated_tokens.push_back(draft_tokens[i]);
+//           }
+//           result.accept_count += accept_up_to;
+
+//           // 在 mismatch 位置用大模型的 token
+//           int32_t large_token = verify_result.accepted_tokens[accept_up_to];
+//           generated_tokens.push_back(large_token);
+//           result.accept_count += 1;
+//           result.reject_count += (draft_tokens.size() - accept_up_to);
+
+//           current_pos += (accept_up_to + 1);
+
+//           // 记录第一次 mismatch
+//           if (result.first_mismatch_pos < 0) {
+//             result.first_mismatch_pos = accept_up_to;
+//           }
+//         } else {
+//           // 全部接受
+//           for (int32_t token : draft_tokens) {
+//             generated_tokens.push_back(token);
+//             result.accept_count += 1;
+//           }
+//           current_pos += draft_tokens.size();
+//         }
+//       }
+//     }
+
+//     result.accepted_tokens = generated_tokens;
+//     return result;
 //   }
 
-//   // 原始权重 fp32 [K, M]（同一组矩阵源）
-//   tensor::Tensor w_fp32_cpu(base::DataType::kDataTypeFp32, K, M, true, alloc_cpu);
-//   for (int i = 0; i < K * M; ++i) {
-//     w_fp32_cpu.index<float>(i) = 0.02f * float((i * 17 + 13) % 101 - 50);
+//  private:
+//   const model::LLama2Model& draft_model_;
+//   const model::LLama2Model& large_model_;
+//   const SpeculativeConfig& config_;
+
+//   // ===== Prefill：用大模型处理完整 prompt =====
+//   void prefill_large_model(const std::vector<int32_t>& prompt_tokens) {
+//     if (prompt_tokens.size() < 2) {
+//       return;  // 太短，不 prefill
+//     }
+
+//     std::vector<int32_t> prefill_tokens(prompt_tokens.begin(), prompt_tokens.end() - 1);
+//     const auto& prefill_emb = large_model_.embedding(prefill_tokens);
+//     auto [prefill_input_tokens, prefill_input_embeddings, prefill_token_num] = prefill_emb;
+//     (void)prefill_input_tokens;
+//     (void)prefill_token_num;
+
+//     tensor::Tensor pos_tensor = large_model_.get_buffer(model::ModelBufferType::kInputPos);
+//     pos_tensor.index<int32_t>(0) = 0;
+
+//     int dummy_next = -1;
+//     large_model_.prefill(prefill_input_embeddings, pos_tensor, dummy_next);
+
+//     cudaError_t err = cudaDeviceSynchronize();
+//     if (err != cudaSuccess) {
+//       LOG(FATAL) << "Large model prefill sync failed: " << cudaGetErrorString(err);
+//     }
+
+//     LOG(INFO) << "Prefill done, prompt_len=" << prompt_tokens.size();
 //   }
 
-//   const int group_cnt = (K * M) / group_size;
-//   const int q_bytes = (K * M + 1) / 2;
-//   const int z_bytes = (group_cnt + 1) / 2;
+//   // ===== 小模型草拟 K 个 token =====
+//   std::vector<int32_t> draft_k_tokens(int32_t start_pos, int32_t draft_len) {
+//     std::vector<int32_t> draft_tokens;
+//     int32_t cur_pos = start_pos;
+//     int32_t next_token = -1;
 
-//   // qint8 需要
-//   tensor::Tensor w_q8_cpu(base::DataType::kDataTypeInt8, K, M, true, alloc_cpu);
-//   tensor::Tensor s_q8_cpu(base::DataType::kDataTypeFp32, group_cnt, true, alloc_cpu);
+//     // 需要准备小模型的初始状态
+//     // 这里简化：直接用小模型的 forward 逐 token
+//     for (int32_t i = 0; i < draft_len; ++i) {
+//       if (i == 0) {
+//         // 从大模型的最后一个 token 开始
+//         if (draft_tokens.empty() && start_pos > 0) {
+//           // 这里需要你的大模型已经有该位置的上下文
+//           next_token = 0;  // 临时占位
+//         }
+//       }
 
-//   // sq4 需要
-//   tensor::Tensor qweight_sq4_cpu(base::DataType::kDataTypeInt8, q_bytes, true, alloc_cpu);
-//   tensor::Tensor s_sq4_cpu(base::DataType::kDataTypeFp32, group_cnt, true, alloc_cpu);
-//   tensor::Tensor zeros_sq4_cpu(base::DataType::kDataTypeInt8, z_bytes, true, alloc_cpu);
+//       // TODO: 这里需要实现小模型独立的 forward
+//       // 暂时用大模型替代（后续会改为真正的小模型）
+//       tensor::Tensor pos_tensor = large_model_.get_buffer(model::ModelBufferType::kInputPos);
+//       pos_tensor.index<int32_t>(0) = cur_pos;
 
-//   build_q8_and_sq4_from_fp32(w_fp32_cpu, K, M, group_size, w_q8_cpu, s_q8_cpu, qweight_sq4_cpu,
-//                              s_sq4_cpu, zeros_sq4_cpu);
+//       std::vector<int32_t> cur_tokens = {next_token};
+//       const auto& token_embedding = large_model_.embedding(cur_tokens);
+//       tensor::Tensor input = large_model_.fill_input(pos_tensor, token_embedding, false);
 
-//   // to cuda
-//   tensor::Tensor input_cu = input_cpu.clone();
-//   input_cu.to_cuda(nullptr);
-//   tensor::Tensor w_q8_cu = w_q8_cpu.clone();
-//   w_q8_cu.to_cuda(nullptr);
-//   tensor::Tensor s_q8_cu = s_q8_cpu.clone();
-//   s_q8_cu.to_cuda(nullptr);
+//       int dummy_next = -1;
+//       large_model_.forward(input, pos_tensor, dummy_next);
 
-//   tensor::Tensor qweight_sq4_cu = qweight_sq4_cpu.clone();
-//   qweight_sq4_cu.to_cuda(nullptr);
-//   tensor::Tensor s_sq4_cu = s_sq4_cpu.clone();
-//   s_sq4_cu.to_cuda(nullptr);
-//   tensor::Tensor zeros_sq4_cu = zeros_sq4_cpu.clone();
-//   zeros_sq4_cu.to_cuda(nullptr);
+//       cudaError_t err = cudaDeviceSynchronize();
+//       if (err != cudaSuccess) {
+//         LOG(ERROR) << "Draft forward sync failed";
+//         break;
+//       }
 
-//   tensor::Tensor out_q8_cu(base::DataType::kDataTypeFp32, B, K, true, alloc_cu);
-//   tensor::Tensor out_sq4_cu(base::DataType::kDataTypeFp32, B, K, true, alloc_cu);
+//       const tensor::Tensor& logits =
+//           large_model_.get_buffer(model::ModelBufferType::kForwardOutput);
+//       int32_t sampled = greedy_sample(logits);
+//       draft_tokens.push_back(sampled);
+//       next_token = sampled;
+//       cur_pos += 1;
+//     }
 
-//   kernel::CudaConfig cfg;
-//   cudaStream_t stream;
-//   ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
-//   cfg.stream = stream;
-
-//   // warmup
-//   for (int i = 0; i < 10; ++i) {
-//     kernel::get_matmul_kernel_quant8(base::DeviceType::kDeviceCUDA)(input_cu, w_q8_cu, out_q8_cu,
-//                                                                     group_size, s_q8_cu, &cfg);
-
-//     kernel::get_matmul_kernel_sq4(base::DeviceType::kDeviceCUDA)(
-//         input_cu, qweight_sq4_cu, s_sq4_cu, zeros_sq4_cu, out_sq4_cu, K, M, group_size, &cfg);
+//     return draft_tokens;
 //   }
-//   ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
-//   // timing
-//   const int iters = 50;
-//   cudaEvent_t st, ed;
-//   ASSERT_EQ(cudaEventCreate(&st), cudaSuccess);
-//   ASSERT_EQ(cudaEventCreate(&ed), cudaSuccess);
+//   // ===== 大模型逐 token 验收 =====
+//   VerificationResult verify_draft_tokens(int32_t start_pos,
+//                                          const std::vector<int32_t>& draft_tokens) {
+//     VerificationResult result;
 
-//   ASSERT_EQ(cudaEventRecord(st, stream), cudaSuccess);
-//   for (int i = 0; i < iters; ++i) {
-//     kernel::get_matmul_kernel_quant8(base::DeviceType::kDeviceCUDA)(input_cu, w_q8_cu, out_q8_cu,
-//                                                                     group_size, s_q8_cu, &cfg);
+//     tensor::Tensor pos_tensor = large_model_.get_buffer(model::ModelBufferType::kInputPos);
+//     int32_t cur_pos = start_pos;
+//     int32_t next_token = -1;
+
+//     for (size_t i = 0; i < draft_tokens.size(); ++i) {
+//       pos_tensor.index<int32_t>(0) = cur_pos;
+
+//       std::vector<int32_t> cur_tokens = {next_token};
+//       const auto& token_embedding = large_model_.embedding(cur_tokens);
+//       tensor::Tensor input = large_model_.fill_input(pos_tensor, token_embedding, false);
+
+//       int dummy_next = -1;
+//       large_model_.forward(input, pos_tensor, dummy_next);
+
+//       cudaError_t err = cudaDeviceSynchronize();
+//       if (err != cudaSuccess) {
+//         LOG(ERROR) << "Verify forward sync failed at pos " << cur_pos;
+//         break;
+//       }
+
+//       const tensor::Tensor& logits =
+//           large_model_.get_buffer(model::ModelBufferType::kForwardOutput);
+//       int32_t large_token = greedy_sample(logits);
+
+//       result.accepted_tokens.push_back(large_token);
+
+//       // 与草稿对比
+//       if (large_token != draft_tokens[i]) {
+//         result.first_mismatch_pos = static_cast<int32_t>(i);
+//         LOG(INFO) << "First mismatch at draft pos " << i << ": draft=" << draft_tokens[i]
+//                   << ", large=" << large_token;
+//         break;
+//       }
+
+//       next_token = large_token;
+//       cur_pos += 1;
+//     }
+
+//     return result;
 //   }
-//   ASSERT_EQ(cudaEventRecord(ed, stream), cudaSuccess);
-//   ASSERT_EQ(cudaEventSynchronize(ed), cudaSuccess);
-//   float q8_ms = 0.f;
-//   ASSERT_EQ(cudaEventElapsedTime(&q8_ms, st, ed), cudaSuccess);
+// };
 
-//   ASSERT_EQ(cudaEventRecord(st, stream), cudaSuccess);
-//   for (int i = 0; i < iters; ++i) {
-//     kernel::get_matmul_kernel_sq4(base::DeviceType::kDeviceCUDA)(
-//         input_cu, qweight_sq4_cu, s_sq4_cu, zeros_sq4_cu, out_sq4_cu, K, M, group_size, &cfg);
+// // ===== Main =====
+// int main(int argc, char* argv[]) {
+//   // ===== 初始化日志 =====
+//   google::InitGoogleLogging(argv[0]);
+//   FLAGS_logtostderr = 1;
+
+//   // ===== 配置路径 =====
+//   const char* draft_checkpoint = "/home/furina/models/stories110M.bin";
+//   const char* large_checkpoint = "/home/furina/models/tinyllama.bin";
+//   const char* tokenizer_path = "/home/furina/models/tokenizer.model";
+
+//   LOG(INFO) << "Loading draft model: " << draft_checkpoint;
+//   model::LLama2Model draft_model(base::TokenizerType::kEncodeSpe, tokenizer_path,
+//   draft_checkpoint,
+//                                  false);
+//   auto draft_init = draft_model.init(base::DeviceType::kDeviceCUDA);
+//   if (!draft_init) {
+//     LOG(FATAL) << "Draft model init failed";
 //   }
-//   ASSERT_EQ(cudaEventRecord(ed, stream), cudaSuccess);
-//   ASSERT_EQ(cudaEventSynchronize(ed), cudaSuccess);
-//   float sq4_ms = 0.f;
-//   ASSERT_EQ(cudaEventElapsedTime(&sq4_ms, st, ed), cudaSuccess);
 
-//   // 防止被当成“无副作用”路径，顺便看数值是否正常
-//   out_q8_cu.to_cpu();
-//   out_sq4_cu.to_cpu();
-//   double sum_q8 = 0.0, sum_sq4 = 0.0;
-//   for (int i = 0; i < out_q8_cu.size(); ++i) sum_q8 += out_q8_cu.index<float>(i);
-//   for (int i = 0; i < out_sq4_cu.size(); ++i) sum_sq4 += out_sq4_cu.index<float>(i);
+//   LOG(INFO) << "Loading large model: " << large_checkpoint;
+//   model::LLama2Model large_model(base::TokenizerType::kEncodeSpe, tokenizer_path,
+//   large_checkpoint,
+//                                  false);
+//   auto large_init = large_model.init(base::DeviceType::kDeviceCUDA);
+//   if (!large_init) {
+//     LOG(FATAL) << "Large model init failed";
+//   }
 
-//   LOG(INFO) << "[NCU_BENCH] q8 avg ms = " << (q8_ms / iters)
-//             << ", sq4 avg ms = " << (sq4_ms / iters)
-//             << ", speedup(q8/sq4) = " << ((sq4_ms > 1e-6f) ? (q8_ms / sq4_ms) : 0.0f);
-//   LOG(INFO) << "[NCU_BENCH] checksum q8=" << sum_q8 << ", sq4=" << sum_sq4;
+//   LOG(INFO) << "Both models loaded successfully";
 
-//   ASSERT_TRUE(std::isfinite(sum_q8));
-//   ASSERT_TRUE(std::isfinite(sum_sq4));
+//   // ===== 配置 =====
+//   SpeculativeConfig config;
+//   config.draft_len = 4;
+//   config.max_new_tokens = 100;
+//   config.strict_mode = true;
 
-//   cudaEventDestroy(st);
-//   cudaEventDestroy(ed);
-//   // cudaStreamDestroy(stream);
+//   // ===== Speculative decode =====
+//   SpeculativeDecoder decoder(draft_model, large_model, config);
+//   std::string prompt = "做一下自我介绍";
+
+//   auto start = std::chrono::steady_clock::now();
+//   VerificationResult result = decoder.decode(prompt, config.max_new_tokens);
+//   auto end = std::chrono::steady_clock::now();
+
+//   double duration = std::chrono::duration<double>(end - start).count();
+
+//   // ===== 输出结果 =====
+//   LOG(INFO) << "========== Speculative Decode Result ==========";
+//   LOG(INFO) << "Generated tokens: " << result.accepted_tokens.size();
+//   LOG(INFO) << "Accept count: " << result.accept_count;
+//   LOG(INFO) << "Reject count: " << result.reject_count;
+//   LOG(INFO) << "First mismatch at: " << result.first_mismatch_pos;
+//   LOG(INFO) << "Duration: " << duration << " s";
+
+//   std::string decoded_text = large_model.decode(result.accepted_tokens);
+//   LOG(INFO) << "Decoded text: " << decoded_text;
+
 //   return 0;
 // }
