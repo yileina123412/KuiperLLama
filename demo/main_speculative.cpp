@@ -44,13 +44,17 @@ struct SpeculativeConfig {
   int32_t kv_prefix = 0;
 
   // 生成配置
-  std::string prompt = "做一下自我介绍";
+  std::string prompt = "Once upon a time, there was a little girl named Lily";
   int32_t draft_len = 4;
   int32_t max_new_tokens = 100;
   bool strict_mode = true;
 
   // Step4: 先固定确定性（greedy-only）
   bool deterministic = true;
+
+  // 模式开关
+  bool scan_mode = true;          // true: 扫描评测
+  bool single_demo_mode = false;  // true: 单条demo输出文本
 
   std::string output_csv = "speculative_result.csv";
 };
@@ -69,7 +73,7 @@ struct BaselineResult {
   double duration_s = 0.0;
 };
 
-static void build_context_state_for_model(const model::LLama2Model& model_ref,
+static void build_context_state_for_model(model::LLama2Model& model_ref,
                                           const std::vector<int32_t>& context_tokens, int32_t& pos,
                                           int32_t& last_token) {
   CHECK(!context_tokens.empty());
@@ -93,9 +97,11 @@ static void build_context_state_for_model(const model::LLama2Model& model_ref,
 
     pos = static_cast<int32_t>(context_tokens.size()) - 1;
     last_token = context_tokens.back();
+    model_ref.set_kv_total_tokens(pos + 1);
   } else {
     pos = 0;
     last_token = context_tokens[0];
+    model_ref.set_kv_total_tokens(1);
   }
 }
 
@@ -121,7 +127,7 @@ static int32_t forward_one_step_for_model(const model::LLama2Model& model_ref, i
   return greedy_sample(logits);
 }
 
-static BaselineResult run_large_baseline_greedy(const model::LLama2Model& large_model,
+static BaselineResult run_large_baseline_greedy(model::LLama2Model& large_model,
                                                 const std::string& prompt, int32_t max_new_tokens) {
   BaselineResult out;
   std::vector<int32_t> prompt_tokens = large_model.encode(prompt);
@@ -137,7 +143,7 @@ static BaselineResult run_large_baseline_greedy(const model::LLama2Model& large_
   auto t0 = std::chrono::steady_clock::now();
   out.tokens.reserve(max_new_tokens);
   for (int32_t i = 0; i < max_new_tokens; ++i) {
-    int32_t tok = forward_one_step_for_model(large_model, pos, last_token);
+    int32_t tok = large_model.decode_one_greedy(pos, last_token);
     out.tokens.push_back(tok);
     last_token = tok;
     pos += 1;
@@ -169,108 +175,117 @@ static bool compare_token_sequences(const std::vector<int32_t>& a, const std::ve
 // ===== 主 Speculative Decode 逻辑 =====
 class SpeculativeDecoder {
  public:
-  SpeculativeDecoder(const model::LLama2Model& draft_model, const model::LLama2Model& large_model,
+  SpeculativeDecoder(model::LLama2Model& draft_model, model::LLama2Model& large_model,
                      const SpeculativeConfig& config)
       : draft_model_(draft_model), large_model_(large_model), config_(config) {}
 
-  // 执行 speculative decode（阶段1：严格逐 token 验收版本）
   VerificationResult decode(const std::string& prompt, int32_t num_gen_tokens) {
     VerificationResult result;
-    if (!config_.strict_mode) {
-      LOG(WARNING) << "Current implementation is strict_mode only.";
-    }
-    CHECK(config_.deterministic) << "Stage1 requires deterministic=true (greedy-only).";
+    CHECK(config_.deterministic) << "Stage2 currently supports deterministic=true only.";
 
-    // 1) prompt tokenize
     std::vector<int32_t> prompt_tokens = large_model_.encode(prompt);
     if (prompt_tokens.empty()) {
       LOG(ERROR) << "Empty prompt tokens!";
       return result;
     }
 
-    // 2) 大模型先走 prompt prefill，拿到 decode 起点状态
-    int32_t large_pos = 0;
-    int32_t large_last_token = -1;
-    build_context_state(large_model_, prompt_tokens, large_pos, large_last_token);
+    std::vector<int32_t> committed_all = prompt_tokens;
 
-    // committed = 最终已确认上下文（prompt + 已生成）
-    std::vector<int32_t> committed = prompt_tokens;
+    DecodeState draft_state;
+    DecodeState large_state;
+    build_state_from_context(draft_model_, committed_all, draft_state);
+    build_state_from_context(large_model_, committed_all, large_state);
 
     while (static_cast<int32_t>(result.accepted_tokens.size()) < num_gen_tokens) {
       const int32_t remain = num_gen_tokens - static_cast<int32_t>(result.accepted_tokens.size());
       const int32_t k = std::min(config_.draft_len, remain);
 
-      // 3) 小模型：基于 committed 上下文，草拟 k 个 token
-      int32_t draft_pos = 0;
-      int32_t draft_last_token = -1;
-      build_context_state(draft_model_, committed, draft_pos, draft_last_token);
+      // 保存 draft 暂存态（S2-3）
+      const auto draft_ckpt = draft_model_.kv_token_checkpoint();
+      const DecodeState draft_state_before = draft_state;
 
-      std::vector<int32_t> draft_tokens;
-      draft_tokens.reserve(k);
-      for (int32_t i = 0; i < k; ++i) {
-        int32_t tok = forward_one_step(draft_model_, draft_pos, draft_last_token);
-        draft_tokens.push_back(tok);
-        draft_last_token = tok;
-        draft_pos += 1;
+      // 小模型草拟
+      std::vector<int32_t> draft_tokens = draft_k_tokens(draft_state, k);
+      if (draft_tokens.empty()) {
+        break;
       }
 
-      // 4) 大模型逐 token 严格验收
-      bool mismatch = false;
-      for (int32_t i = 0; i < static_cast<int32_t>(draft_tokens.size()); ++i) {
-        int32_t large_tok = forward_one_step(large_model_, large_pos, large_last_token);
+      // 大模型批量验证（S2-2）
+      auto verify = large_model_.verify_draft_batch_block(large_state.pos, large_state.last_token,
+                                                          draft_tokens);
 
-        if (large_tok == draft_tokens[i]) {
-          // 接受
-          result.accepted_tokens.push_back(large_tok);
-          result.accept_count += 1;
-          committed.push_back(large_tok);
+      const int32_t old_size = static_cast<int32_t>(result.accepted_tokens.size());
+      std::vector<int32_t> round_committed;
 
-          large_last_token = large_tok;
-          large_pos += 1;
-        } else {
-          // mismatch：从当前位开始，草稿全部丢弃，输出大模型 token
-          mismatch = true;
-          if (result.first_mismatch_pos < 0) {
-            result.first_mismatch_pos = static_cast<int32_t>(result.accepted_tokens.size());
-          }
-
-          // 当前位输出大模型 token（保证零精度损失）
-          result.accepted_tokens.push_back(large_tok);
-          result.accept_count += 1;
-          committed.push_back(large_tok);
-
-          // 统计被拒 token（当前位及之后的草稿）
-          for (int32_t j = i; j < static_cast<int32_t>(draft_tokens.size()); ++j) {
-            result.rejected_tokens.push_back(draft_tokens[j]);
-          }
-          result.reject_count += (static_cast<int32_t>(draft_tokens.size()) - i);
-
-          large_last_token = large_tok;
-          large_pos += 1;
-          break;
-        }
-
-        if (static_cast<int32_t>(result.accepted_tokens.size()) >= num_gen_tokens) {
-          break;
-        }
+      // 接受前缀
+      for (int32_t i = 0; i < verify.accepted_prefix_len; ++i) {
+        const int32_t t = draft_tokens[i];
+        result.accepted_tokens.push_back(t);
+        committed_all.push_back(t);
+        round_committed.push_back(t);
+        result.accept_count += 1;
       }
 
-      (void)mismatch;
+      if (verify.all_accepted) {
+        if (!draft_tokens.empty()) {
+          large_state.pos += static_cast<int32_t>(draft_tokens.size());
+          large_state.last_token = draft_tokens.back();
+        }
+      } else {
+        // mismatch 位置：使用大模型 token
+        result.accepted_tokens.push_back(verify.mismatch_large_token);
+        committed_all.push_back(verify.mismatch_large_token);
+        round_committed.push_back(verify.mismatch_large_token);
+        result.accept_count += 1;
+
+        // 拒绝剩余草稿
+        for (int32_t i = verify.accepted_prefix_len; i < static_cast<int32_t>(draft_tokens.size());
+             ++i) {
+          result.rejected_tokens.push_back(draft_tokens[i]);
+        }
+        result.reject_count +=
+            (static_cast<int32_t>(draft_tokens.size()) - verify.accepted_prefix_len);
+
+        if (result.first_mismatch_pos < 0) {
+          result.first_mismatch_pos = old_size + verify.accepted_prefix_len;
+        }
+
+        // 大模型状态前进：accepted_prefix + mismatch_token
+        large_state.pos += verify.accepted_prefix_len + 1;
+        large_state.last_token = verify.mismatch_large_token;
+
+        // draft 回退（S2-3）
+        draft_model_.kv_token_rollback(draft_ckpt);
+        draft_state = draft_state_before;
+
+        // 回放“本轮已提交token”，避免全量重建上下文
+        for (int32_t t : round_committed) {
+          (void)draft_model_.decode_one_greedy(draft_state.pos, draft_state.last_token);
+          draft_state.last_token = t;
+          draft_state.pos += 1;
+        }
+      }
     }
 
+    if (static_cast<int32_t>(result.accepted_tokens.size()) > num_gen_tokens) {
+      result.accepted_tokens.resize(num_gen_tokens);
+    }
     return result;
   }
 
  private:
-  const model::LLama2Model& draft_model_;
-  const model::LLama2Model& large_model_;
+  struct DecodeState {
+    int32_t pos = 0;
+    int32_t last_token = -1;
+    bool ready = false;
+  };
+
+  model::LLama2Model& draft_model_;
+  model::LLama2Model& large_model_;
   const SpeculativeConfig& config_;
 
-  // 统一：给定完整上下文 token，构建模型 decode 起始状态
-  // 输出：pos=最后一个上下文 token 的位置，last_token=最后一个上下文 token
-  void build_context_state(const model::LLama2Model& model_ref,
-                           const std::vector<int32_t>& context_tokens, int32_t& pos,
-                           int32_t& last_token) const {
+  void build_state_from_context(model::LLama2Model& model_ref,
+                                const std::vector<int32_t>& context_tokens, DecodeState& st) const {
     CHECK(!context_tokens.empty());
 
     if (context_tokens.size() >= 2) {
@@ -290,36 +305,30 @@ class SpeculativeDecoder {
         LOG(FATAL) << "prefill sync failed: " << cudaGetErrorString(err);
       }
 
-      pos = static_cast<int32_t>(context_tokens.size()) - 1;
-      last_token = context_tokens.back();
+      st.pos = static_cast<int32_t>(context_tokens.size()) - 1;
+      st.last_token = context_tokens.back();
+      st.ready = true;
+
+      model_ref.set_kv_total_tokens(st.pos + 1);
     } else {
-      pos = 0;
-      last_token = context_tokens[0];
+      st.pos = 0;
+      st.last_token = context_tokens[0];
+      st.ready = true;
+      model_ref.set_kv_total_tokens(1);
     }
   }
 
-  // 单步 forward + greedy
-  int32_t forward_one_step(const model::LLama2Model& model_ref, int32_t pos,
-                           int32_t input_token) const {
-    tensor::Tensor pos_tensor = model_ref.get_buffer(model::ModelBufferType::kInputPos);
-    pos_tensor.index<int32_t>(0) = pos;
-
-    std::vector<int32_t> cur_tokens = {input_token};
-    const auto& emb = model_ref.embedding(cur_tokens);
-    tensor::Tensor input = model_ref.fill_input(pos_tensor, emb, false);
-
-    int dummy_next = -1;
-    model_ref.forward(input, pos_tensor, dummy_next);
-
-    cudaError_t err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-      LOG(FATAL) << "forward sync failed at pos=" << pos << ", err=" << cudaGetErrorString(err);
+  std::vector<int32_t> draft_k_tokens(DecodeState& draft_state, int32_t k) {
+    std::vector<int32_t> out =
+        draft_model_.draft_block_greedy(draft_state.pos, draft_state.last_token, k);
+    if (!out.empty()) {
+      draft_state.pos += static_cast<int32_t>(out.size());
+      draft_state.last_token = out.back();
     }
-
-    const tensor::Tensor& logits = model_ref.get_buffer(model::ModelBufferType::kForwardOutput);
-    return greedy_sample(logits);
+    return out;
   }
 };
+
 // ===== Main =====
 int main(int argc, char* argv[]) {
   // ===== 初始化日志 =====
@@ -363,87 +372,151 @@ int main(int argc, char* argv[]) {
   LOG(INFO) << "Models loaded successfully";
 
   LOG(INFO) << "Unified KV config: window=" << config.kv_window << ", prefix=" << config.kv_prefix;
-  // ===== 可选覆盖默认配置（按需改）=====
-  config.draft_len = 4;
-  config.max_new_tokens = 100;
+
+  // ===== 配置覆盖（按需）=====
   config.strict_mode = true;
   config.deterministic = true;
-  config.kv_prefix = 0;  // 改成 >0 即启用前缀保护
+  config.kv_prefix = 0;
+  config.max_new_tokens = 128;
 
-  // ===== Speculative decode =====
-  // ===== Step7: 一致性基线（先跑 baseline，避免第二个大模型占显存）=====
-  large_model.configure_kv_runtime(config.kv_window, config.kv_prefix, true);
-  BaselineResult baseline =
-      run_large_baseline_greedy(large_model, config.prompt, config.max_new_tokens);
+  if (config.single_demo_mode) {
+    // ===== 单条 demo 模式（有输出文本）=====
+    config.draft_len = 2;
 
-  // ===== 再跑 speculative 前，重置两边 KV 运行态 =====
-  draft_model.configure_kv_runtime(config.kv_window, config.kv_prefix, true);
-  large_model.configure_kv_runtime(config.kv_window, config.kv_prefix, true);
+    large_model.configure_kv_runtime(config.kv_window, config.kv_prefix, true);
+    BaselineResult baseline =
+        run_large_baseline_greedy(large_model, config.prompt, config.max_new_tokens);
 
-  // ===== Speculative decode =====
-  SpeculativeDecoder decoder(draft_model, large_model, config);
-  auto start = std::chrono::steady_clock::now();
-  VerificationResult result = decoder.decode(config.prompt, config.max_new_tokens);
-  auto end = std::chrono::steady_clock::now();
+    draft_model.configure_kv_runtime(config.kv_window, config.kv_prefix, true);
+    large_model.configure_kv_runtime(config.kv_window, config.kv_prefix, true);
 
-  double spec_duration = std::chrono::duration<double>(end - start).count();
+    SpeculativeDecoder decoder(draft_model, large_model, config);
+    auto t0 = std::chrono::steady_clock::now();
+    VerificationResult result = decoder.decode(config.prompt, config.max_new_tokens);
+    auto t1 = std::chrono::steady_clock::now();
 
-  int32_t mismatch_idx = -1;
-  bool exact_match = compare_token_sequences(result.accepted_tokens, baseline.tokens, mismatch_idx);
+    const double spec_s = std::chrono::duration<double>(t1 - t0).count();
+    const double speedup = (spec_s > 0.0) ? (baseline.duration_s / spec_s) : 0.0;
 
-  // ===== 统计 =====
-  const double spec_tps =
-      result.accepted_tokens.empty()
-          ? 0.0
-          : static_cast<double>(result.accepted_tokens.size()) / std::max(spec_duration, 1e-9);
-  const double base_tps = baseline.tokens.empty() ? 0.0
-                                                  : static_cast<double>(baseline.tokens.size()) /
-                                                        std::max(baseline.duration_s, 1e-9);
-  const double speedup = (spec_duration > 0.0) ? (baseline.duration_s / spec_duration) : 0.0;
+    int32_t mismatch_idx = -1;
+    bool exact_match =
+        compare_token_sequences(result.accepted_tokens, baseline.tokens, mismatch_idx);
 
-  // ===== 输出结果 =====
-  LOG(INFO) << "========== Speculative Decode Result ==========";
-  LOG(INFO) << "Generated tokens: " << result.accepted_tokens.size();
-  LOG(INFO) << "Accept count: " << result.accept_count;
-  LOG(INFO) << "Reject count: " << result.reject_count;
-  LOG(INFO) << "First mismatch at (internal draft verify): " << result.first_mismatch_pos;
-  LOG(INFO) << "Speculative duration: " << spec_duration << " s";
-  LOG(INFO) << "Baseline duration: " << baseline.duration_s << " s";
-  LOG(INFO) << "Speculative tokens/s: " << spec_tps;
-  LOG(INFO) << "Baseline tokens/s: " << base_tps;
-  LOG(INFO) << "Speedup (baseline/spec): " << speedup;
+    LOG(INFO) << "========== SINGLE DEMO ==========";
+    LOG(INFO) << "exact_match=" << (exact_match ? "Y" : "N") << ", speedup=" << speedup
+              << ", accept_count=" << result.accept_count
+              << ", reject_count=" << result.reject_count;
 
-  if (!exact_match) {
-    LOG(ERROR) << "[STEP7 FAIL] token sequence mismatch, first idx = " << mismatch_idx
-               << ", spec_token="
-               << (mismatch_idx >= 0 &&
-                           mismatch_idx < static_cast<int32_t>(result.accepted_tokens.size())
-                       ? result.accepted_tokens[mismatch_idx]
-                       : -1)
-               << ", base_token="
-               << (mismatch_idx >= 0 && mismatch_idx < static_cast<int32_t>(baseline.tokens.size())
-                       ? baseline.tokens[mismatch_idx]
-                       : -1);
-  } else {
-    LOG(INFO) << "[STEP7 PASS] token sequence EXACT MATCH with baseline.";
+    std::string spec_text = large_model.decode(result.accepted_tokens);
+    std::string base_text = large_model.decode(baseline.tokens);
+    LOG(INFO) << "[SPEC TEXT] " << spec_text;
+    LOG(INFO) << "[BASE TEXT] " << base_text;
+
+    return exact_match ? 0 : 2;
   }
 
-  // ===== Step8: P0 DoD =====
-  const bool dod_exact_match = exact_match;
-  const bool dod_len_ok =
-      (static_cast<int32_t>(result.accepted_tokens.size()) == config.max_new_tokens);
-  const bool dod_deterministic = config.deterministic;
+  // ===== 扫描评测模式 =====
+  config.scan_mode = true;
+  const std::vector<int32_t> draft_len_grid = {2, 4};
+  const std::vector<std::string> prompts = {
+      "Once upon a time, there was a little girl named Lily",
+      "Explain the concept of overfitting in machine learning in simple terms.",
+      "写一段关于春天的短文，100字左右。",
+      "Please provide three practical tips to improve coding productivity."};
 
-  const bool p0_pass = dod_exact_match && dod_len_ok && dod_deterministic;
+  std::ofstream csv(config.output_csv);
+  csv << "prompt_id,draft_len,baseline_s,spec_s,baseline_tps,spec_tps,speedup,accept_count,reject_"
+         "count,accept_rate,exact_match\n";
 
-  LOG(INFO) << "========== P0 DoD ==========";
-  LOG(INFO) << "DoD-1 exact token match: " << (dod_exact_match ? "PASS" : "FAIL");
-  LOG(INFO) << "DoD-2 generated length == max_new_tokens: " << (dod_len_ok ? "PASS" : "FAIL");
-  LOG(INFO) << "DoD-3 deterministic mode enabled: " << (dod_deterministic ? "PASS" : "FAIL");
-  LOG(INFO) << "P0 STATUS: " << (p0_pass ? "PASS" : "FAIL");
+  int total_runs = 0;
+  int exact_failures = 0;
+  std::map<int32_t, double> speedup_sum;
+  std::map<int32_t, int> speedup_cnt;
 
-  std::string decoded_text = large_model.decode(result.accepted_tokens);
-  LOG(INFO) << "Decoded text: " << decoded_text;
+  for (int pidx = 0; pidx < static_cast<int>(prompts.size()); ++pidx) {
+    const std::string& prompt = prompts[pidx];
 
-  return p0_pass ? 0 : 2;
+    large_model.configure_kv_runtime(config.kv_window, config.kv_prefix, true);
+    BaselineResult baseline = run_large_baseline_greedy(large_model, prompt, config.max_new_tokens);
+
+    for (int32_t dlen : draft_len_grid) {
+      SpeculativeConfig run_cfg = config;
+      run_cfg.prompt = prompt;
+      run_cfg.draft_len = dlen;
+
+      draft_model.configure_kv_runtime(run_cfg.kv_window, run_cfg.kv_prefix, true);
+      large_model.configure_kv_runtime(run_cfg.kv_window, run_cfg.kv_prefix, true);
+
+      SpeculativeDecoder decoder(draft_model, large_model, run_cfg);
+
+      auto t0 = std::chrono::steady_clock::now();
+      VerificationResult result = decoder.decode(run_cfg.prompt, run_cfg.max_new_tokens);
+      auto t1 = std::chrono::steady_clock::now();
+      const double spec_s = std::chrono::duration<double>(t1 - t0).count();
+
+      int32_t mismatch_idx = -1;
+      bool exact_match =
+          compare_token_sequences(result.accepted_tokens, baseline.tokens, mismatch_idx);
+
+      const double base_tps =
+          baseline.tokens.empty()
+              ? 0.0
+              : static_cast<double>(baseline.tokens.size()) / std::max(baseline.duration_s, 1e-9);
+      const double spec_tps =
+          result.accepted_tokens.empty()
+              ? 0.0
+              : static_cast<double>(result.accepted_tokens.size()) / std::max(spec_s, 1e-9);
+      const double speedup = (spec_s > 0.0) ? (baseline.duration_s / spec_s) : 0.0;
+
+      const int denom = std::max(1, result.accept_count + result.reject_count);
+      const double accept_rate =
+          static_cast<double>(result.accept_count) / static_cast<double>(denom);
+
+      csv << pidx << "," << dlen << "," << baseline.duration_s << "," << spec_s << "," << base_tps
+          << "," << spec_tps << "," << speedup << "," << result.accept_count << ","
+          << result.reject_count << "," << accept_rate << "," << (exact_match ? 1 : 0) << "\n";
+
+      total_runs += 1;
+      if (!exact_match) {
+        exact_failures += 1;
+      }
+
+      speedup_sum[dlen] += speedup;
+      speedup_cnt[dlen] += 1;
+
+      LOG(INFO) << "[SCAN] prompt_id=" << pidx << ", draft_len=" << dlen << ", speedup=" << speedup
+                << ", exact_match=" << (exact_match ? "Y" : "N") << ", accept_rate=" << accept_rate;
+    }
+  }
+
+  csv.close();
+  LOG(INFO) << "Scan CSV written to: " << config.output_csv;
+
+  int32_t best_dlen = -1;
+  double best_avg_speedup = -1.0;
+  for (auto& kv : speedup_sum) {
+    const int32_t dlen = kv.first;
+    const double avg = kv.second / std::max(1, speedup_cnt[dlen]);
+    LOG(INFO) << "[AVG] draft_len=" << dlen << ", avg_speedup=" << avg;
+    if (avg > best_avg_speedup) {
+      best_avg_speedup = avg;
+      best_dlen = dlen;
+    }
+  }
+
+  const bool dod_exact = (exact_failures == 0);
+  const bool dod_perf = (best_avg_speedup >= 1.10);
+  const bool dod_stability =
+      (total_runs == static_cast<int>(prompts.size()) * static_cast<int>(draft_len_grid.size()));
+  const bool p1_pass = dod_exact && dod_perf && dod_stability;
+
+  LOG(INFO) << "========== P1 DoD ==========";
+  LOG(INFO) << "DoD-1 exact token match all runs: " << (dod_exact ? "PASS" : "FAIL");
+  LOG(INFO) << "DoD-2 best avg speedup >= 1.10: " << (dod_perf ? "PASS" : "FAIL");
+  LOG(INFO) << "DoD-3 scan coverage complete: " << (dod_stability ? "PASS" : "FAIL");
+  LOG(INFO) << "Best draft_len: " << best_dlen;
+  LOG(INFO) << "Best avg speedup: " << best_avg_speedup;
+  LOG(INFO) << "P1 STATUS: " << (p1_pass ? "PASS" : "FAIL");
+
+  return p1_pass ? 0 : 3;
 }

@@ -59,6 +59,22 @@ class LLama2Model : public Model {
 
   op::EmbeddingOutput embedding(const std::vector<int>& tokens) const override;
 
+  // ===== Speculative decode helpers =====
+  struct BatchVerifyResult {
+    bool all_accepted = true;
+    int32_t accepted_prefix_len = 0;
+    int32_t mismatch_large_token = -1;  // only valid when all_accepted=false
+  };
+
+  int32_t decode_one_greedy(int32_t pos, int32_t input_token);
+  std::vector<int32_t> draft_block_greedy(int32_t start_pos, int32_t last_token, int32_t k);
+  BatchVerifyResult verify_draft_batch_block(int32_t start_pos, int32_t last_token,
+                                             const std::vector<int32_t>& draft_tokens);
+
+  // 兼容旧调用
+  BatchVerifyResult verify_draft_batch(int32_t start_pos, int32_t last_token,
+                                       const std::vector<int32_t>& draft_tokens);
+
  private:
   void init_mem() override;
 

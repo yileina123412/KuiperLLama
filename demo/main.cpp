@@ -118,6 +118,7 @@ int32_t generate(const model::LLama2Model& model, const std::string& sentence, i
   auto tokens = model.encode(sentence);
 
   int32_t prompt_len = tokens.size();
+  printf("\nprompt_len: %d \n", prompt_len);
   LOG_IF(FATAL, tokens.empty()) << "The tokens is empty.";
 
   tensor::Tensor pos_tensor = model.get_buffer(model::ModelBufferType::kInputPos);
@@ -149,6 +150,7 @@ int32_t generate(const model::LLama2Model& model, const std::string& sentence, i
     auto end_ttft = std::chrono::steady_clock::now();
     double ttft_ms = std::chrono::duration<double, std::milli>(end_ttft - start_time).count();
     printf("\nTTFT(prefill): %lf ms\n", ttft_ms);
+    printf("\nTTFT(prefill): %lf ms\n", ttft_ms / prompt_len);
 
     // ===== 2) 从最后一个 prompt token 开始 decode =====
     pos = prompt_len - 1;
@@ -292,7 +294,7 @@ int main(int argc, char* argv[]) {
   if (!init_status) {
     LOG(FATAL) << "The model init failed, the error code is: " << init_status.get_err_code();
   }
-  const std::string& sentence = "做一下自我介绍";
+  const std::string& sentence = "hello the world,my name is bob.please tell me something.";
 
   const std::vector<ExpCase> cases = {
       {2048, 0, 1000, "baseline_w2048_p0"},

@@ -3,6 +3,7 @@
 #include "../kernels_interface.h"
 #include "matmul_kernel.cuh"
 namespace kernel {
+#define TILE_SIZE 16
 // 非量化
 // THREAD_PER_BLOCK：每个block里的线程数  ROW_PER_BLOCK：每个block负责多少行输出
 // 这个模板是共享内存和cub库的时候要用的，需要编译时已知而不是运行时已知
@@ -63,28 +64,82 @@ __global__ void matmul_kernel_cu_fp32(const float* input, const float* weight, f
   }
 }
 
+// __global__ void matmul_kernel_cu_fp32_batch(const float* input, const float* weight, float*
+// output,
+//                                             int B, int M, int K) {
+//   // grid = (B, K)
+//   const int b = (int)blockIdx.x;
+//   const int k = (int)blockIdx.y;
+//   const int tid = (int)threadIdx.x;
+
+//   extern __shared__ float ssum[];
+//   float sum = 0.f;
+
+//   const float* x = input + (size_t)b * M;
+//   const float* w = weight + (size_t)k * M;
+
+//   for (int i = tid; i < M; i += blockDim.x) sum += x[i] * w[i];
+//   ssum[tid] = sum;
+//   __syncthreads();
+
+//   for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+//     if (tid < offset) ssum[tid] += ssum[tid + offset];
+//     __syncthreads();
+//   }
+//   if (tid == 0) output[(size_t)b * K + k] = ssum[0];
+// }
+
 __global__ void matmul_kernel_cu_fp32_batch(const float* input, const float* weight, float* output,
                                             int B, int M, int K) {
-  // grid = (B, K)
-  const int b = (int)blockIdx.x;
-  const int k = (int)blockIdx.y;
-  const int tid = (int)threadIdx.x;
+  // block 维度: (TILE_SIZE, TILE_SIZE) -> (16, 16)
+  int tx = threadIdx.x;
+  int ty = threadIdx.y;
 
-  extern __shared__ float ssum[];
-  float sum = 0.f;
+  // 当前线程负责计算 output[row, col]
+  int row = blockIdx.y * TILE_SIZE + ty;  // 映射到 B
+  int col = blockIdx.x * TILE_SIZE + tx;  // 映射到 K
 
-  const float* x = input + (size_t)b * M;
-  const float* w = weight + (size_t)k * M;
+  // 申请共享内存，用于缓存一小块 Input 和 Weight
+  __shared__ float sA[TILE_SIZE][TILE_SIZE];
+  __shared__ float sW[TILE_SIZE][TILE_SIZE];
 
-  for (int i = tid; i < M; i += blockDim.x) sum += x[i] * w[i];
-  ssum[tid] = sum;
-  __syncthreads();
+  float sum = 0.0f;
 
-  for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
-    if (tid < offset) ssum[tid] += ssum[tid + offset];
+  // 沿着 M 维度，以 TILE_SIZE 为步长分块步进
+  for (int m = 0; m < M; m += TILE_SIZE) {
+    // 1. 协作将 Input 数据读入共享内存
+    if (row < B && m + tx < M) {
+      sA[ty][tx] = input[row * M + (m + tx)];
+    } else {
+      sA[ty][tx] = 0.0f;
+    }
+
+    // 2. 协作将 Weight 数据读入共享内存
+    // 注意：用户的 weight 是按 [K, M] 扁平化存储的
+    // 所以 col 是行索引，m + ty 是列索引
+    if (col < K && m + ty < M) {
+      sW[ty][tx] = weight[col * M + (m + ty)];
+    } else {
+      sW[ty][tx] = 0.0f;
+    }
+
+    // 等待一个 Block 内的所有线程读完这一小块数据
+    __syncthreads();
+
+// 3. 在极速的共享内存中完成 16x16 的局部矩阵乘法
+#pragma unroll
+    for (int i = 0; i < TILE_SIZE; ++i) {
+      sum += sA[ty][i] * sW[i][tx];
+    }
+
+    // 等待计算完成，然后再进入下一次 m 循环覆盖共享内存
     __syncthreads();
   }
-  if (tid == 0) output[(size_t)b * K + k] = ssum[0];
+
+  // 4. 将最终结果写回全局显存
+  if (row < B && col < K) {
+    output[row * K + col] = sum;
+  }
 }
 
 template <int THREAD_PER_BLOCK, int ROW_PER_BLOCK>
@@ -120,36 +175,56 @@ __global__ void matmul_kernel_cu_fp32int8(const float* input, const int8_t* weig
   }
 }
 
+// ==========================================
+// [极其重大的优化] 2D (Prefill) Tiled QInt8 算子 (包含提前反量化)
+// ==========================================
 __global__ void matmul_kernel_cu_qint8_batch(const float* input, const int8_t* weight,
                                              const float* scales, int group_size, float* output,
                                              int B, int M, int K) {
-  // grid = (B, K)
-  const int b = (int)blockIdx.x;
-  const int k = (int)blockIdx.y;
-  const int tid = (int)threadIdx.x;
+  int tx = threadIdx.x;
+  int ty = threadIdx.y;
 
-  extern __shared__ float ssum[];
-  float sum = 0.f;
+  int row = blockIdx.y * TILE_SIZE + ty;  // 映射到 B
+  int col = blockIdx.x * TILE_SIZE + tx;  // 映射到 K
 
-  const float* x = input + (size_t)b * M;
-  const int8_t* w = weight + (size_t)k * M;
+  __shared__ float sA[TILE_SIZE][TILE_SIZE];
+  // 共享内存里存的是解压后的 float 数据！
+  __shared__ float sW[TILE_SIZE][TILE_SIZE];
 
-  for (int i = tid; i < M; i += blockDim.x) {
-    const int weight_idx = k * M + i;
-    const int group_idx = weight_idx / group_size;
-    const float w_deq = scales[group_idx] * (float)w[i];
-    sum += x[i] * w_deq;
-  }
+  float sum = 0.0f;
 
-  ssum[tid] = sum;
-  __syncthreads();
+  for (int m = 0; m < M; m += TILE_SIZE) {
+    // 1. 读 Input
+    if (row < B && m + tx < M) {
+      sA[ty][tx] = input[row * M + (m + tx)];
+    } else {
+      sA[ty][tx] = 0.0f;
+    }
 
-  for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
-    if (tid < offset) ssum[tid] += ssum[tid + offset];
+    // 2. 读 Weight，并同时完成【反量化】操作！
+    if (col < K && m + ty < M) {
+      const int weight_idx = col * M + (m + ty);
+      const int group_idx = weight_idx / group_size;
+      // 将 int8 转 float 并乘上 scale，存入极速的共享内存
+      sW[ty][tx] = static_cast<float>(weight[weight_idx]) * scales[group_idx];
+    } else {
+      sW[ty][tx] = 0.0f;
+    }
+
+    __syncthreads();
+
+// 3. 此时的计算逻辑与 FP32 完全一致，极其纯粹且高效
+#pragma unroll
+    for (int i = 0; i < TILE_SIZE; ++i) {
+      sum += sA[ty][i] * sW[i][tx];
+    }
+
     __syncthreads();
   }
 
-  if (tid == 0) output[(size_t)b * K + k] = ssum[0];
+  if (row < B && col < K) {
+    output[row * K + col] = sum;
+  }
 }
 
 void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
@@ -193,15 +268,19 @@ void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
   CHECK_EQ(output.get_dim(0), B);
   CHECK_EQ(output.get_dim(1), K);
 
-  const int threads = 256;
-  dim3 grid(B, K);
-  size_t shmem = threads * sizeof(float);
+  // const int threads = 256;
+  // dim3 grid(B, K);
+  // size_t shmem = threads * sizeof(float);
+
+  dim3 threads(TILE_SIZE, TILE_SIZE);  // 16x16 = 256
+  // Grid 向上取整，确保覆盖全部数据
+  dim3 grid((K + TILE_SIZE - 1) / TILE_SIZE, (B + TILE_SIZE - 1) / TILE_SIZE);
 
   if (config && config->stream) {
-    matmul_kernel_cu_fp32_batch<<<grid, threads, shmem, config->stream>>>(
+    matmul_kernel_cu_fp32_batch<<<grid, threads, 0, config->stream>>>(
         input.ptr<float>(), weight.ptr<float>(), const_cast<float*>(output.ptr<float>()), B, M, K);
   } else {
-    matmul_kernel_cu_fp32_batch<<<grid, threads, shmem>>>(
+    matmul_kernel_cu_fp32_batch<<<grid, threads>>>(
         input.ptr<float>(), weight.ptr<float>(), const_cast<float*>(output.ptr<float>()), B, M, K);
   }
 
@@ -250,16 +329,15 @@ void matmul_kernel_cu_qint8(const tensor::Tensor& input, const tensor::Tensor& w
   CHECK_EQ(output.get_dim(0), B);
   CHECK_EQ(output.get_dim(1), K);
 
-  const int threads = 256;
-  dim3 grid(B, K);
-  size_t shmem = threads * sizeof(float);
+  dim3 threads(TILE_SIZE, TILE_SIZE);  // 16x16
+  dim3 grid((K + TILE_SIZE - 1) / TILE_SIZE, (B + TILE_SIZE - 1) / TILE_SIZE);
 
   if (config->stream) {
-    matmul_kernel_cu_qint8_batch<<<grid, threads, shmem, config->stream>>>(
+    matmul_kernel_cu_qint8_batch<<<grid, threads, 0, config->stream>>>(
         input.ptr<float>(), weight.ptr<int8_t>(), scale.ptr<float>(), group_size,
         const_cast<float*>(output.ptr<float>()), B, M, K);
   } else {
-    matmul_kernel_cu_qint8_batch<<<grid, threads, shmem>>>(
+    matmul_kernel_cu_qint8_batch<<<grid, threads>>>(
         input.ptr<float>(), weight.ptr<int8_t>(), scale.ptr<float>(), group_size,
         const_cast<float*>(output.ptr<float>()), B, M, K);
   }

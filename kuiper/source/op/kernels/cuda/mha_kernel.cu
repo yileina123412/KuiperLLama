@@ -138,99 +138,8 @@ __device__ __forceinline__ float dot_qk_fp32(const float* __restrict__ q,
 }
 
 // grid = (head_num, T), block = 256 threads
-// __global__ void multi_head_attention_prefill_kernel(int32_t start_pos, int32_t T, int32_t
-// seq_len,
-//                                                     const float* __restrict__ query_2d,  // [T,
-//                                                     dim] float* __restrict__ output_2d,       //
-//                                                     [T, dim] const float* __restrict__ key_cache,
-//                                                     const float* __restrict__ value_cache,
-//                                                     int32_t kv_dim, int32_t kv_mul,
-//                                                     int32_t head_num, int32_t head_size,
-//                                                     int32_t layer_offset) {
-//   const int head = (int)blockIdx.x;
-//   const int t = (int)blockIdx.y;
-//   if (head >= head_num || t >= T) return;
-
-//   const int32_t pos = start_pos + t;
-//   if (pos >= seq_len) return;
-
-//   extern __shared__ float smem[];
-//   float* s_query = smem;             // [head_size]
-//   float* s_w = s_query + head_size;  // [blockDim.x]
-//   __shared__ float s_max;
-//   __shared__ float s_sumexp;
-
-//   const float scale = 1.f / sqrtf((float)head_size);
-//   const int head_offset = (head / kv_mul) * head_size;
-
-//   const int dim = head_num * head_size;
-//   const float* q = query_2d + (size_t)t * dim + (size_t)head * head_size;
-//   float* o = output_2d + (size_t)t * dim + (size_t)head * head_size;
-
-//   // load q to shared
-//   for (int i = threadIdx.x; i < head_size; i += blockDim.x) s_query[i] = q[i];
-//   __syncthreads();
-
-//   using BlockReduce = cub::BlockReduce<float, thread_num>;
-//   __shared__ typename BlockReduce::TempStorage temp;
-
-//   // pass1: max
-//   float local_max = -FLT_MAX;
-//   for (int p = threadIdx.x; p <= pos; p += blockDim.x) {
-//     const float* k = key_cache + layer_offset + (size_t)p * kv_dim + head_offset;
-//     float s = dot_qk_fp32(s_query, k, head_size) * scale;
-//     local_max = fmaxf(local_max, s);
-//   }
-//   float maxv = BlockReduce(temp).Reduce(local_max, cub::Max());
-//   if (threadIdx.x == 0) s_max = maxv;
-//   __syncthreads();
-//   maxv = s_max;
-
-//   // pass2: sumexp + accumulate output (unnormalized)
-//   if (threadIdx.x == 0) s_sumexp = 0.f;
-//   __syncthreads();
-
-//   // init output accum
-//   for (int i = threadIdx.x; i < head_size; i += blockDim.x) o[i] = 0.f;
-//   __syncthreads();
-
-//   for (int p0 = 0; p0 <= pos; p0 += blockDim.x) {
-//     int p = p0 + threadIdx.x;
-//     float w = 0.f;
-//     if (p <= pos) {
-//       const float* k = key_cache + layer_offset + (size_t)p * kv_dim + head_offset;
-//       float s = dot_qk_fp32(s_query, k, head_size) * scale;
-//       w = expf(s - maxv);
-//     }
-//     s_w[threadIdx.x] = w;
-//     __syncthreads();
-
-//     // tile sumexp
-//     float tile_sum = BlockReduce(temp).Sum(w);
-//     if (threadIdx.x == 0) s_sumexp += tile_sum;
-//     __syncthreads();
-
-//     // accumulate output for this tile
-//     const int tile_len = min((int)blockDim.x, (int)(pos + 1 - p0));
-//     for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
-//       float acc = 0.f;
-//       for (int j = 0; j < tile_len; ++j) {
-//         const int pp = p0 + j;
-//         const float ww = s_w[j];
-//         const float* v = value_cache + layer_offset + (size_t)pp * kv_dim + head_offset;
-//         acc += ww * v[i];
-//       }
-//       o[i] += acc;
-//     }
-//     __syncthreads();
-//   }
-
-//   float sumexp = s_sumexp;
-//   for (int i = threadIdx.x; i < head_size; i += blockDim.x) o[i] /= sumexp;
-// }
-// grid = (head_num, T), block = 256 threads
 __global__ void multi_head_attention_prefill_kernel(
-    int32_t start_pos, int32_t T, int32_t seq_len, int32_t kv_window_size,
+    int32_t start_pos, int32_t T, int32_t seq_len, int32_t kv_window_size, int32_t kv_valid_len,
     int32_t kv_prefix_keep_tokens, const float* __restrict__ query_2d,
     float* __restrict__ output_2d, const float* __restrict__ key_cache,
     const float* __restrict__ value_cache, int32_t kv_dim, int32_t kv_mul, int32_t head_num,
@@ -240,7 +149,8 @@ __global__ void multi_head_attention_prefill_kernel(
   if (head >= head_num || t >= T) return;
 
   const int pos_t = start_pos + t;
-  const int seen = pos_t + 1;
+  const int seen_raw = pos_t + 1;
+  const int seen = max(1, min(seen_raw, kv_valid_len));
 
   const int window = max(1, min(kv_window_size, seq_len));
   int prefix = kv_prefix_keep_tokens;
@@ -375,7 +285,7 @@ void mha_kernel_cu(int32_t pos, int32_t head_num, int32_t layer_index, int32_t s
   size_t shmem = (size_t)(head_size + thread_num) * sizeof(float);
 
   multi_head_attention_prefill_kernel<<<grid, thread_num, shmem, stream>>>(
-      start_pos, T, seq_len, kv_window_size, kv_prefix_keep_tokens, query2d, out2d, key_cache,
-      value_cache, kv_dim, kv_mul, head_num, head_size, layer_offset);
+      start_pos, T, seq_len, kv_window_size, kv_valid_len, kv_prefix_keep_tokens, query2d, out2d,
+      key_cache, value_cache, kv_dim, kv_mul, head_num, head_size, layer_offset);
 }
 }  // namespace kernel

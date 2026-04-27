@@ -46,7 +46,9 @@ void mha_kernel(int32_t pos, int32_t head_num, int32_t layer_index, int32_t seq_
 
     for (int32_t t = 0; t < T; ++t) {
       const int32_t cur_pos = start_pos + t;
-      const int32_t seen = cur_pos + 1;
+      const int32_t seen_raw = cur_pos + 1;
+      const int32_t valid_req = std::max(1, std::min(kv_valid_len, window));
+      const int32_t seen = std::min(seen_raw, valid_req);
 
       const int32_t prefix_visible = std::min(prefix, seen);
       const int32_t tail_visible = std::min(std::max(seen - prefix, 0), tail_cap);

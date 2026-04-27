@@ -246,15 +246,23 @@ base::Status LLama2Model::prefill(const tensor::Tensor& input, const tensor::Ten
       // 2D QKV + 一次写 KV cache
       attention_qkv_block(layer_idx, pos_tensor, rms2d, query2d);
 
-      // 2D MHA：你之前的 MHA 会在 query.dims_size()==2 时走 prefill kernel
+      // 2D MHA：之前的 MHA 会在 query.dims_size()==2 时走 prefill kernel
       auto mha_layer = llama_layers_->mha_layer_;
       CHECK_NE(mha_layer, nullptr);
+
       const int32_t start_pos = pos_tensor.index<int32_t>(0);
       auto mha_ptr = std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer);
       mha_ptr->set_pos(start_pos);
       mha_ptr->set_layer_idx(layer_idx);
-      mha_ptr->set_kv_window_size(effective_kv_window_size());
-      mha_ptr->set_kv_valid_len(0);
+
+      const int32_t window = effective_kv_window_size();
+      const int32_t seen_after_block = start_pos + token_num;  // 逻辑上处理完 block 后可见长度
+      int32_t valid_len = seen_after_block;
+      if (valid_len > window) valid_len = window;
+      if (valid_len <= 0) valid_len = 1;
+
+      mha_ptr->set_kv_window_size(window);
+      mha_ptr->set_kv_valid_len(valid_len);
       mha_ptr->set_kv_prefix_keep_tokens(effective_kv_prefix_keep_tokens());
 
       tensor::Tensor score_storage = get_buffer(ModelBufferType::kScoreStorage);  // 占位参数
@@ -1067,13 +1075,11 @@ void LLama2Model::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_ten
   CHECK_NE(mha_ptr, nullptr);
 
   const int32_t window = effective_kv_window_size();
-  int32_t valid_len = pos + 1;
-  if (valid_len > window) {
-    valid_len = window;
-  }
-
+  int32_t valid_len = kv_valid_token_num();
   if (valid_len <= 0) {
-    valid_len = 1;
+    valid_len = pos + 1;
+    if (valid_len > window) valid_len = window;
+    if (valid_len <= 0) valid_len = 1;
   }
 
   mha_ptr->set_pos(pos);
@@ -1158,6 +1164,74 @@ int32_t LLama2Model::post_processing(const tensor::Tensor& pos, bool is_prompt) 
                                                  cuda_config_ ? cuda_config_->stream : nullptr));
   }
   return next;
+}
+
+int32_t LLama2Model::decode_one_greedy(int32_t pos, int32_t input_token) {
+  tensor::Tensor pos_tensor = get_buffer(ModelBufferType::kInputPos);
+  pos_tensor.index<int32_t>(0) = pos;
+
+  std::vector<int32_t> cur_tokens = {input_token};
+  const auto& emb = embedding(cur_tokens);
+  tensor::Tensor input = fill_input(pos_tensor, emb, false);
+
+  int dummy_next = -1;
+  STATUS_CHECK(forward(input, pos_tensor, dummy_next));
+
+  tensor::Tensor forward_output = get_buffer(ModelBufferType::kForwardOutput);
+  const float* forward_logits = forward_output.ptr<float>();
+
+  const int32_t next = static_cast<int32_t>(sampler_->sample(
+      forward_logits, forward_output.size(), cuda_config_ ? cuda_config_->stream : nullptr));
+
+  advance_kv_total_tokens(1);
+  return next;
+}
+
+std::vector<int32_t> LLama2Model::draft_block_greedy(int32_t start_pos, int32_t last_token,
+                                                     int32_t k) {
+  std::vector<int32_t> out;
+  out.reserve(std::max(0, k));
+
+  int32_t pos = start_pos;
+  int32_t in_tok = last_token;
+
+  for (int32_t i = 0; i < k; ++i) {
+    const int32_t tok = decode_one_greedy(pos, in_tok);
+    out.push_back(tok);
+    in_tok = tok;
+    pos += 1;
+  }
+  return out;
+}
+
+LLama2Model::BatchVerifyResult LLama2Model::verify_draft_batch_block(
+    int32_t start_pos, int32_t last_token, const std::vector<int32_t>& draft_tokens) {
+  BatchVerifyResult out;
+  out.all_accepted = true;
+  out.accepted_prefix_len = 0;
+  out.mismatch_large_token = -1;
+
+  int32_t pos = start_pos;
+  int32_t in_tok = last_token;
+
+  for (int32_t i = 0; i < static_cast<int32_t>(draft_tokens.size()); ++i) {
+    const int32_t large_tok = decode_one_greedy(pos, in_tok);
+    if (large_tok == draft_tokens[i]) {
+      out.accepted_prefix_len += 1;
+      in_tok = large_tok;
+      pos += 1;
+    } else {
+      out.all_accepted = false;
+      out.mismatch_large_token = large_tok;
+      break;
+    }
+  }
+  return out;
+}
+
+LLama2Model::BatchVerifyResult LLama2Model::verify_draft_batch(
+    int32_t start_pos, int32_t last_token, const std::vector<int32_t>& draft_tokens) {
+  return verify_draft_batch_block(start_pos, last_token, draft_tokens);
 }
 
 }  // namespace model

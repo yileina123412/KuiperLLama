@@ -118,6 +118,50 @@ void Model::configure_kv_runtime(int32_t kv_window_size, int32_t kv_prefix_keep_
   }
 }
 
+Model::KVCheckpoint Model::kv_checkpoint() const {
+  KVCheckpoint checkpoint;
+  checkpoint.kv_total_tokens = kv_total_tokens_;
+
+  if (buffers_.count(ModelBufferType::kKeyCache) > 0 &&
+      buffers_.count(ModelBufferType::kValueCache) > 0) {
+    checkpoint.key_cache = get_buffer(ModelBufferType::kKeyCache).clone();
+    checkpoint.value_cache = get_buffer(ModelBufferType::kValueCache).clone();
+    checkpoint.valid = true;
+  }
+  return checkpoint;
+}
+
+void Model::kv_rollback(const KVCheckpoint& checkpoint) {
+  if (!checkpoint.valid) {
+    return;
+  }
+
+  kv_total_tokens_ = checkpoint.kv_total_tokens;
+
+  if (buffers_.count(ModelBufferType::kKeyCache) > 0 &&
+      buffers_.count(ModelBufferType::kValueCache) > 0) {
+    auto& key_cache = get_buffer(ModelBufferType::kKeyCache);
+    auto& value_cache = get_buffer(ModelBufferType::kValueCache);
+
+    CHECK(key_cache.assign(checkpoint.key_cache.get_buffer()));
+    CHECK(value_cache.assign(checkpoint.value_cache.get_buffer()));
+  }
+}
+
+void Model::kv_commit(const KVCheckpoint& checkpoint) {
+  (void)checkpoint;  // 目前提交是 no-op，语义上保留接口
+}
+
+Model::KVTokenCheckpoint Model::kv_token_checkpoint() const {
+  KVTokenCheckpoint ckpt;
+  ckpt.kv_total_tokens = kv_total_tokens_;
+  return ckpt;
+}
+
+void Model::kv_token_rollback(const KVTokenCheckpoint& checkpoint) {
+  kv_total_tokens_ = checkpoint.kv_total_tokens;
+}
+
 int32_t Model::kv_prefix_keep_tokens() const { return kv_prefix_keep_tokens_; }
 
 int32_t Model::effective_kv_prefix_keep_tokens() const {

@@ -86,6 +86,25 @@ class Model {
   void configure_kv_runtime(int32_t kv_window_size, int32_t kv_prefix_keep_tokens,
                             bool reset_kv_total_tokens = true);
 
+  // ===== Speculative decode: KV checkpoint / rollback =====
+  struct KVCheckpoint {
+    int64_t kv_total_tokens = 0;
+    tensor::Tensor key_cache;
+    tensor::Tensor value_cache;
+    bool valid = false;
+  };
+
+  KVCheckpoint kv_checkpoint() const;
+  void kv_rollback(const KVCheckpoint& checkpoint);
+  void kv_commit(const KVCheckpoint& checkpoint);
+
+  // 轻量 checkpoint：只保存逻辑 token 计数（不拷贝整块KV）
+  struct KVTokenCheckpoint {
+    int64_t kv_total_tokens = 0;
+  };
+  KVTokenCheckpoint kv_token_checkpoint() const;
+  void kv_token_rollback(const KVTokenCheckpoint& checkpoint);
+
   // 从KV Cache中切片获取特定层和位置的键值对
   virtual std::pair<tensor::Tensor, tensor::Tensor> slice_kv_cache(int32_t layer_idx,
                                                                    int32_t token_pos) const;
