@@ -3,6 +3,10 @@
 #include "../kernels_interface.h"
 #include "matmul_kernel.cuh"
 namespace kernel {
+
+// 引入 const_cast 解决 const 指针转换报错问题
+#define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(const_cast<float*>(&(pointer)))[0])
+#define FETCH_CHAR4(pointer) (reinterpret_cast<const char4*>(const_cast<int8_t*>(&(pointer)))[0])
 #define TILE_SIZE 16
 // 非量化
 // THREAD_PER_BLOCK：每个block里的线程数  ROW_PER_BLOCK：每个block负责多少行输出
@@ -63,31 +67,6 @@ __global__ void matmul_kernel_cu_fp32(const float* input, const float* weight, f
     __syncthreads();
   }
 }
-
-// __global__ void matmul_kernel_cu_fp32_batch(const float* input, const float* weight, float*
-// output,
-//                                             int B, int M, int K) {
-//   // grid = (B, K)
-//   const int b = (int)blockIdx.x;
-//   const int k = (int)blockIdx.y;
-//   const int tid = (int)threadIdx.x;
-
-//   extern __shared__ float ssum[];
-//   float sum = 0.f;
-
-//   const float* x = input + (size_t)b * M;
-//   const float* w = weight + (size_t)k * M;
-
-//   for (int i = tid; i < M; i += blockDim.x) sum += x[i] * w[i];
-//   ssum[tid] = sum;
-//   __syncthreads();
-
-//   for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
-//     if (tid < offset) ssum[tid] += ssum[tid + offset];
-//     __syncthreads();
-//   }
-//   if (tid == 0) output[(size_t)b * K + k] = ssum[0];
-// }
 
 __global__ void matmul_kernel_cu_fp32_batch(const float* input, const float* weight, float* output,
                                             int B, int M, int K) {
@@ -227,6 +206,363 @@ __global__ void matmul_kernel_cu_qint8_batch(const float* input, const int8_t* w
   }
 }
 
+// ==========================================
+// [FP32 极致优化版] 借鉴 mysgemm_v7 架构
+// BM=128, BN=128, BK=8, TM=8, TN=8
+// ==========================================
+template <const int BM = 128, const int BN = 128, const int BK = 8, const int TM = 8,
+          const int TN = 8>
+__global__ void __launch_bounds__(256)
+    matmul_kernel_cu_fp32_batch_opt(const float* input, const float* weight, float* output, int B,
+                                    int M, int K) {
+  int bx = blockIdx.x;
+  int by = blockIdx.y;
+  int tid = threadIdx.x;
+
+  // 线程映射：每个 block 256 线程，切分为 16x16 的网格
+  int tx = (tid % (BN / TN)) * TN;
+  int ty = (tid / (BN / TN)) * TM;
+
+  // 双缓冲共享内存，大小 [2][BK][BM/BN]
+  // 为了避免 Bank Conflict，我们让线程连续写内层维度
+  __shared__ float As[2][BK][BM];
+  __shared__ float Bs[2][BK][BN];
+
+  // 全局显存搬运坐标 (每个线程搬运 4 个元素)
+  int load_a_row = tid % BM;
+  int load_a_col = (tid / BM) * 4;
+  int load_b_row = tid % BN;
+  int load_b_col = (tid / BN) * 4;
+
+  int global_a_row = by * BM + load_a_row;
+  int global_b_row = bx * BN + load_b_row;
+
+  // 寄存器分块 (类似 accum[TM][TN], a_frag, b_frag)
+  float accum[TM][TN] = {0.f};
+  float a_frag[2][TM];
+  float b_frag[2][TN];
+  float4 ldg_a_reg;
+  float4 ldg_b_reg;
+
+  // ----------------------------------------
+  // Prologue: 预取第一个块 (Block 0)
+  // ----------------------------------------
+  if (global_a_row < B && load_a_col < M) {
+    ldg_a_reg = FETCH_FLOAT4(input[global_a_row * M + load_a_col]);
+  } else {
+    ldg_a_reg = make_float4(0.f, 0.f, 0.f, 0.f);
+  }
+  As[0][load_a_col][load_a_row] = ldg_a_reg.x;
+  As[0][load_a_col + 1][load_a_row] = ldg_a_reg.y;
+  As[0][load_a_col + 2][load_a_row] = ldg_a_reg.z;
+  As[0][load_a_col + 3][load_a_row] = ldg_a_reg.w;
+
+  if (global_b_row < K && load_b_col < M) {
+    // 由于 Weight 是 [K, M]，所以 load_b_col 沿着 M 维前进，可以完美 float4 读取！
+    ldg_b_reg = FETCH_FLOAT4(weight[global_b_row * M + load_b_col]);
+  } else {
+    ldg_b_reg = make_float4(0.f, 0.f, 0.f, 0.f);
+  }
+  Bs[0][load_b_col][load_b_row] = ldg_b_reg.x;
+  Bs[0][load_b_col + 1][load_b_row] = ldg_b_reg.y;
+  Bs[0][load_b_col + 2][load_b_row] = ldg_b_reg.z;
+  Bs[0][load_b_col + 3][load_b_row] = ldg_b_reg.w;
+
+  __syncthreads();
+
+// 预取第一个计算碎片到寄存器
+#pragma unroll
+  for (int m = 0; m < TM; m += 4) {
+    FETCH_FLOAT4(a_frag[0][m]) = FETCH_FLOAT4(As[0][0][ty + m]);
+  }
+#pragma unroll
+  for (int n = 0; n < TN; n += 4) {
+    FETCH_FLOAT4(b_frag[0][n]) = FETCH_FLOAT4(Bs[0][0][tx + n]);
+  }
+
+  int write_idx = 1;
+  int load_idx;
+
+  // ----------------------------------------
+  // Main Loop: 软件流水线
+  // ----------------------------------------
+  for (int k_idx = 0; k_idx < M; k_idx += BK) {
+    int k_next = k_idx + BK;
+
+    // 1. 全局显存异步预取下一个大块 (隐藏访存延迟)
+    if (k_next < M) {
+      if (global_a_row < B && k_next + load_a_col < M) {
+        ldg_a_reg = FETCH_FLOAT4(input[global_a_row * M + k_next + load_a_col]);
+      } else {
+        ldg_a_reg = make_float4(0.f, 0.f, 0.f, 0.f);
+      }
+      if (global_b_row < K && k_next + load_b_col < M) {
+        ldg_b_reg = FETCH_FLOAT4(weight[global_b_row * M + k_next + load_b_col]);
+      } else {
+        ldg_b_reg = make_float4(0.f, 0.f, 0.f, 0.f);
+      }
+    }
+
+    load_idx = write_idx ^ 1;
+
+// 2. 当前块的计算 (前 BK-1 步)
+#pragma unroll
+    for (int bk = 0; bk < BK - 1; bk++) {
+// 预取下一步的寄存器碎片
+#pragma unroll
+      for (int m = 0; m < TM; m += 4) {
+        FETCH_FLOAT4(a_frag[(bk + 1) % 2][m]) = FETCH_FLOAT4(As[load_idx][bk + 1][ty + m]);
+      }
+#pragma unroll
+      for (int n = 0; n < TN; n += 4) {
+        FETCH_FLOAT4(b_frag[(bk + 1) % 2][n]) = FETCH_FLOAT4(Bs[load_idx][bk + 1][tx + n]);
+      }
+// 乘加计算
+#pragma unroll
+      for (int m = 0; m < TM; m++) {
+#pragma unroll
+        for (int n = 0; n < TN; n++) {
+          accum[m][n] += a_frag[bk % 2][m] * b_frag[bk % 2][n];
+        }
+      }
+    }
+
+    // 3. 将预取好的下一个大块写入共享内存 (Double Buffering)
+    if (k_next < M) {
+      As[write_idx][load_a_col][load_a_row] = ldg_a_reg.x;
+      As[write_idx][load_a_col + 1][load_a_row] = ldg_a_reg.y;
+      As[write_idx][load_a_col + 2][load_a_row] = ldg_a_reg.z;
+      As[write_idx][load_a_col + 3][load_a_row] = ldg_a_reg.w;
+
+      Bs[write_idx][load_b_col][load_b_row] = ldg_b_reg.x;
+      Bs[write_idx][load_b_col + 1][load_b_row] = ldg_b_reg.y;
+      Bs[write_idx][load_b_col + 2][load_b_row] = ldg_b_reg.z;
+      Bs[write_idx][load_b_col + 3][load_b_row] = ldg_b_reg.w;
+
+      __syncthreads();
+
+// 为下一次循环的 bk=0 预取寄存器
+#pragma unroll
+      for (int m = 0; m < TM; m += 4) {
+        FETCH_FLOAT4(a_frag[0][m]) = FETCH_FLOAT4(As[write_idx][0][ty + m]);
+      }
+#pragma unroll
+      for (int n = 0; n < TN; n += 4) {
+        FETCH_FLOAT4(b_frag[0][n]) = FETCH_FLOAT4(Bs[write_idx][0][tx + n]);
+      }
+      write_idx ^= 1;
+    }
+
+// 4. 计算当前块的最后一步 (第 BK-1 步)
+#pragma unroll
+    for (int m = 0; m < TM; m++) {
+#pragma unroll
+      for (int n = 0; n < TN; n++) {
+        accum[m][n] += a_frag[(BK - 1) % 2][m] * b_frag[(BK - 1) % 2][n];
+      }
+    }
+  }
+
+// ----------------------------------------
+// Epilogue: 结果写回全局显存
+// ----------------------------------------
+#pragma unroll
+  for (int m = 0; m < TM; m++) {
+    int global_y = by * BM + ty + m;
+    if (global_y < B) {
+#pragma unroll
+      for (int n = 0; n < TN; n += 4) {
+        int global_x = bx * BN + tx + n;
+        if (global_x < K) {
+          float4 ctmp;
+          ctmp.x = accum[m][n];
+          ctmp.y = accum[m][n + 1];
+          ctmp.z = accum[m][n + 2];
+          ctmp.w = accum[m][n + 3];
+          FETCH_FLOAT4(output[global_y * K + global_x]) = ctmp;
+        }
+      }
+    }
+  }
+}
+
+// ==========================================
+// [QInt8 极致优化版] 融合反量化流水线
+// ==========================================
+template <const int BM = 128, const int BN = 128, const int BK = 8, const int TM = 8,
+          const int TN = 8>
+__global__ void __launch_bounds__(256)
+    matmul_kernel_cu_qint8_batch_opt(const float* input, const int8_t* weight, const float* scales,
+                                     int group_size, float* output, int B, int M, int K) {
+  int bx = blockIdx.x;
+  int by = blockIdx.y;
+  int tid = threadIdx.x;
+
+  int tx = (tid % (BN / TN)) * TN;
+  int ty = (tid / (BN / TN)) * TM;
+
+  __shared__ float As[2][BK][BM];
+  __shared__ float Bs[2][BK][BN];  // 共享内存中存放的依然是反量化后的 FP32 数据！
+
+  int load_a_row = tid % BM;
+  int load_a_col = (tid / BM) * 4;
+  int load_b_row = tid % BN;
+  int load_b_col = (tid / BN) * 4;
+
+  int global_a_row = by * BM + load_a_row;
+  int global_b_row = bx * BN + load_b_row;
+
+  float accum[TM][TN] = {0.f};
+  float a_frag[2][TM];
+  float b_frag[2][TN];
+  float4 ldg_a_reg;
+  float4 ldg_b_reg;
+
+  // Prologue (Block 0)
+  if (global_a_row < B && load_a_col < M) {
+    ldg_a_reg = FETCH_FLOAT4(input[global_a_row * M + load_a_col]);
+  } else {
+    ldg_a_reg = make_float4(0.f, 0.f, 0.f, 0.f);
+  }
+  As[0][load_a_col][load_a_row] = ldg_a_reg.x;
+  As[0][load_a_col + 1][load_a_row] = ldg_a_reg.y;
+  As[0][load_a_col + 2][load_a_row] = ldg_a_reg.z;
+  As[0][load_a_col + 3][load_a_row] = ldg_a_reg.w;
+
+  if (global_b_row < K && load_b_col < M) {
+    int weight_idx = global_b_row * M + load_b_col;
+    int group_idx = weight_idx / group_size;
+    float scale = scales[group_idx];
+
+    // 绝妙的优化：一次读取 4 个 int8_t (char4)，在加载到寄存器时完成反量化
+    char4 tmp_c = FETCH_CHAR4(weight[weight_idx]);
+    ldg_b_reg.x = static_cast<float>(tmp_c.x) * scale;
+    ldg_b_reg.y = static_cast<float>(tmp_c.y) * scale;
+    ldg_b_reg.z = static_cast<float>(tmp_c.z) * scale;
+    ldg_b_reg.w = static_cast<float>(tmp_c.w) * scale;
+  } else {
+    ldg_b_reg = make_float4(0.f, 0.f, 0.f, 0.f);
+  }
+  Bs[0][load_b_col][load_b_row] = ldg_b_reg.x;
+  Bs[0][load_b_col + 1][load_b_row] = ldg_b_reg.y;
+  Bs[0][load_b_col + 2][load_b_row] = ldg_b_reg.z;
+  Bs[0][load_b_col + 3][load_b_row] = ldg_b_reg.w;
+
+  __syncthreads();
+
+#pragma unroll
+  for (int m = 0; m < TM; m += 4) {
+    FETCH_FLOAT4(a_frag[0][m]) = FETCH_FLOAT4(As[0][0][ty + m]);
+  }
+#pragma unroll
+  for (int n = 0; n < TN; n += 4) {
+    FETCH_FLOAT4(b_frag[0][n]) = FETCH_FLOAT4(Bs[0][0][tx + n]);
+  }
+
+  int write_idx = 1;
+  int load_idx;
+
+  // Main Loop
+  for (int k_idx = 0; k_idx < M; k_idx += BK) {
+    int k_next = k_idx + BK;
+
+    if (k_next < M) {
+      if (global_a_row < B && k_next + load_a_col < M) {
+        ldg_a_reg = FETCH_FLOAT4(input[global_a_row * M + k_next + load_a_col]);
+      } else {
+        ldg_a_reg = make_float4(0.f, 0.f, 0.f, 0.f);
+      }
+
+      if (global_b_row < K && k_next + load_b_col < M) {
+        int weight_idx = global_b_row * M + k_next + load_b_col;
+        int group_idx = weight_idx / group_size;
+        float scale = scales[group_idx];
+
+        char4 tmp_c = FETCH_CHAR4(weight[weight_idx]);
+        ldg_b_reg.x = static_cast<float>(tmp_c.x) * scale;
+        ldg_b_reg.y = static_cast<float>(tmp_c.y) * scale;
+        ldg_b_reg.z = static_cast<float>(tmp_c.z) * scale;
+        ldg_b_reg.w = static_cast<float>(tmp_c.w) * scale;
+      } else {
+        ldg_b_reg = make_float4(0.f, 0.f, 0.f, 0.f);
+      }
+    }
+
+    load_idx = write_idx ^ 1;
+
+#pragma unroll
+    for (int bk = 0; bk < BK - 1; bk++) {
+#pragma unroll
+      for (int m = 0; m < TM; m += 4) {
+        FETCH_FLOAT4(a_frag[(bk + 1) % 2][m]) = FETCH_FLOAT4(As[load_idx][bk + 1][ty + m]);
+      }
+#pragma unroll
+      for (int n = 0; n < TN; n += 4) {
+        FETCH_FLOAT4(b_frag[(bk + 1) % 2][n]) = FETCH_FLOAT4(Bs[load_idx][bk + 1][tx + n]);
+      }
+
+#pragma unroll
+      for (int m = 0; m < TM; m++) {
+#pragma unroll
+        for (int n = 0; n < TN; n++) {
+          accum[m][n] += a_frag[bk % 2][m] * b_frag[bk % 2][n];
+        }
+      }
+    }
+
+    if (k_next < M) {
+      As[write_idx][load_a_col][load_a_row] = ldg_a_reg.x;
+      As[write_idx][load_a_col + 1][load_a_row] = ldg_a_reg.y;
+      As[write_idx][load_a_col + 2][load_a_row] = ldg_a_reg.z;
+      As[write_idx][load_a_col + 3][load_a_row] = ldg_a_reg.w;
+
+      Bs[write_idx][load_b_col][load_b_row] = ldg_b_reg.x;
+      Bs[write_idx][load_b_col + 1][load_b_row] = ldg_b_reg.y;
+      Bs[write_idx][load_b_col + 2][load_b_row] = ldg_b_reg.z;
+      Bs[write_idx][load_b_col + 3][load_b_row] = ldg_b_reg.w;
+
+      __syncthreads();
+
+#pragma unroll
+      for (int m = 0; m < TM; m += 4) {
+        FETCH_FLOAT4(a_frag[0][m]) = FETCH_FLOAT4(As[write_idx][0][ty + m]);
+      }
+#pragma unroll
+      for (int n = 0; n < TN; n += 4) {
+        FETCH_FLOAT4(b_frag[0][n]) = FETCH_FLOAT4(Bs[write_idx][0][tx + n]);
+      }
+      write_idx ^= 1;
+    }
+
+#pragma unroll
+    for (int m = 0; m < TM; m++) {
+#pragma unroll
+      for (int n = 0; n < TN; n++) {
+        accum[m][n] += a_frag[(BK - 1) % 2][m] * b_frag[(BK - 1) % 2][n];
+      }
+    }
+  }
+
+#pragma unroll
+  for (int m = 0; m < TM; m++) {
+    int global_y = by * BM + ty + m;
+    if (global_y < B) {
+#pragma unroll
+      for (int n = 0; n < TN; n += 4) {
+        int global_x = bx * BN + tx + n;
+        if (global_x < K) {
+          float4 ctmp;
+          ctmp.x = accum[m][n];
+          ctmp.y = accum[m][n + 1];
+          ctmp.z = accum[m][n + 2];
+          ctmp.w = accum[m][n + 3];
+          FETCH_FLOAT4(output[global_y * K + global_x]) = ctmp;
+        }
+      }
+    }
+  }
+}
+
 void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
                       const tensor::Tensor& output, const float scale, const CudaConfig* config) {
   CHECK(!input.is_empty() && input.dims_size() <= 2);
@@ -271,6 +607,20 @@ void matmul_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
   // const int threads = 256;
   // dim3 grid(B, K);
   // size_t shmem = threads * sizeof(float);
+
+  // // 对应 BM=128, BN=128 架构
+  // dim3 threads(256);
+  // dim3 grid((K + 128 - 1) / 128, (B + 128 - 1) / 128);
+
+  // if (config && config->stream) {
+  //   matmul_kernel_cu_fp32_batch_opt<32, 128, 8, 4, 8><<<grid, threads, 0, config->stream>>>(
+  //       input.ptr<float>(), weight.ptr<float>(), const_cast<float*>(output.ptr<float>()), B, M,
+  //       K);
+  // } else {
+  //   matmul_kernel_cu_fp32_batch_opt<32, 128, 8, 4, 8><<<grid, threads>>>(
+  //       input.ptr<float>(), weight.ptr<float>(), const_cast<float*>(output.ptr<float>()), B, M,
+  //       K);
+  // }
 
   dim3 threads(TILE_SIZE, TILE_SIZE);  // 16x16 = 256
   // Grid 向上取整，确保覆盖全部数据
@@ -328,6 +678,18 @@ void matmul_kernel_cu_qint8(const tensor::Tensor& input, const tensor::Tensor& w
   CHECK_EQ(output.dims_size(), 2);
   CHECK_EQ(output.get_dim(0), B);
   CHECK_EQ(output.get_dim(1), K);
+
+  // dim3 threads(256);
+  // dim3 grid((K + 128 - 1) / 128, (B + 128 - 1) / 128);
+  // if (config->stream) {
+  //   matmul_kernel_cu_qint8_batch_opt<32, 128, 8, 4, 8><<<grid, threads, 0, config->stream>>>(
+  //       input.ptr<float>(), weight.ptr<int8_t>(), scale.ptr<float>(), group_size,
+  //       const_cast<float*>(output.ptr<float>()), B, M, K);
+  // } else {
+  //   matmul_kernel_cu_qint8_batch_opt<32, 128, 8, 4, 8>
+  //       <<<grid, threads>>>(input.ptr<float>(), weight.ptr<int8_t>(), scale.ptr<float>(),
+  //                           group_size, const_cast<float*>(output.ptr<float>()), B, M, K);
+  // }
 
   dim3 threads(TILE_SIZE, TILE_SIZE);  // 16x16
   dim3 grid((K + TILE_SIZE - 1) / TILE_SIZE, (B + TILE_SIZE - 1) / TILE_SIZE);

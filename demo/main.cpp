@@ -269,14 +269,16 @@ int main(int argc, char* argv[]) {
   // }
   // const char* checkpoint_path = argv[1];  // e.g. out/model.bin
   // const char* tokenizer_path = argv[2];
-  // const char* checkpoint_path =
-  //     "/home/furina/models/stories110M.bin";  // e.g.
+  // const char* checkpoint_path = "/home/furina/models/stories110M.bin";  // e.g.
+  // const char* checkpoint_path = "/home/furina/models/stories260K.bin";  // e.g.
+  // const char* checkpoint_path = "/home/furina/models/llama-160m.bin";  // e.g.
   // const char* checkpoint_path = "/home/furina/models/tinyllama_int8.bin";  // e.g.
   const char* checkpoint_path = "/home/furina/models/tinyllama.bin";  // e.g.
   // const char* checkpoint_path = "/home/furina/models/llama2_7b_smooth_pro_v3.bin";
   // const char* checkpoint_path = "/home/furina/models/tinyllama_4bit.bin";
   // const char* checkpoint_path = "/home/furina/models/llama2_7b_smooth_pro_v3_32.bin";
 
+  // const char* tokenizer_path = "/home/furina/models/tok512.model";  // stories260K
   const char* tokenizer_path = "/home/furina/models/tokenizer.model";
   // const char* checkpoint_path =
   //     "/home/furina/models/llama32_1bnq.bin";  // e.g.

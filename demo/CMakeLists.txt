@@ -28,6 +28,21 @@ if (LLAMA3_SUPPORT)
 endif ()
 set_target_properties(speculative_infer PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
+
+# ========== main_chunk Demo ==========
+add_executable(main_chunk main_chunk.cpp)
+target_link_directories(main_chunk PUBLIC ${PROJECT_SOURCE_DIR}/lib)
+target_link_libraries(main_chunk llama)
+if (LLAMA3_SUPPORT)
+    message(STATUS "LINK LLAMA3 SUPPORT for main_chunk")
+    find_package(absl REQUIRED)
+    find_package(re2 REQUIRED)
+    find_package(nlohmann_json REQUIRED)
+    target_link_libraries(main_chunk absl::base re2::re2 nlohmann_json::nlohmann_json)
+endif ()
+set_target_properties(main_chunk PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+
 if (QWEN2_SUPPORT)
     message(STATUS "LINK QWEN2 SUPPORT")
     add_executable(qwen_infer main_qwen.cpp)

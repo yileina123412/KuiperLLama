@@ -1,5 +1,6 @@
 #include <base/cuda_config.h>
 #include <base/tick.h>
+#include <math.h>
 #include <tensor/tensor.h>
 #include <cfloat>
 #include <cub/cub.cuh>
@@ -17,6 +18,22 @@ __device__ void softmax_gpu(float* __restrict__ x, int size) {
   // 一个block计算处理一个向量x
   int tid = threadIdx.x;
   int step = blockDim.x;
+
+  // // --- DEBUG: check input NaN/Inf before softmax ---
+  // if (tid == 0) {
+  //   int bad = 0;
+  //   for (int i = 0; i < size; ++i) {
+  //     float v = x[i];
+  //     if (isnan(v) || isinf(v)) {
+  //       bad = 1;
+  //       break;
+  //     }
+  //   }
+  //   if (bad) {
+  //     printf("[softmax_gpu] input has NaN/Inf (size=%d)\n", size);
+  //   }
+  // }
+  // __syncthreads();
 
   // find max value (for numerical stability)
   // this should be FLT_MAX, not 0 !!!!
@@ -53,6 +70,20 @@ __device__ void softmax_gpu(float* __restrict__ x, int size) {
   for (int i = tid; i < size; i += step) {
     x[i] /= sum;
   }
+  // // --- DEBUG: check output NaN/Inf and sum ---
+  // if (tid == 0) {
+  //   int bad = 0;
+  //   float s = 0.f;
+  //   for (int i = 0; i < size; ++i) {
+  //     float v = x[i];
+  //     if (isnan(v) || isinf(v)) bad = 1;
+  //     s += v;
+  //   }
+  //   if (bad || s < 0.98f || s > 1.02f) {
+  //     printf("[softmax_gpu] output bad=%d sum=%f (size=%d)\n", bad, s, size);
+  //   }
+  // }
+  // __syncthreads();
 }
 // 一个block计算一个头
 __global__ void multi_head_attention_kernel(int32_t pos, int32_t seq_len, float* query,
