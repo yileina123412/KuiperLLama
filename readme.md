@@ -34,7 +34,7 @@
 进行PD分离后，prefill阶段的速度提升，从访存瓶颈转化为计算瓶颈
 ### Chunked Prefill
 将 prompt tokens 切成固定大小块，每个块依次进行prefill.
-对prefill阶段进行了Chunked Prefill的优化。以llama1.1b模型为示例进行了测试：
+对prefill阶段进行了Chunked Prefill的优化。以llama1.1b模型为示例进行了测试，promote的token数量是1793个tokens：
 | llama1.1b | 非chunked  | 128     | 256       | 512     |
 | --------- | --------- | ------- | --------- | ------- |
 | prefill时间 | 8079.54ms | 8040.82 | 7874.38ms | 8018.73 |
@@ -44,7 +44,7 @@
     
 - **Chunks=7 & 4:** 语义开始恢复，虽然还有些奇怪的造词（如 `pleuralisticaly`），但已经能看出在尝试描述系统。
     
-- **Chunks=14:** **质量最高**。模型竟然精准地总结出了你的系统特性（“sliding-window attention”, “minimize TTFT”, “chunked prefill”）。
+- **Chunks=14:** **质量最高**。模型可以精准地总结出了系统特性（“sliding-window attention”, “minimize TTFT”, “chunked prefill”）。
 
 分析：
 在该测试条件下观察到，分块越细，单次 Attention 计算中 $QK^T$ 累加的范围越小，浮点数精度损失越小。在 Chunks=14 时，单次计算只有 128 个 token 的关联，这让数值极其稳定， logits 更加平滑，从而让模型“智商回归”。
